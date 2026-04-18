@@ -327,6 +327,7 @@ def add_textbox(
     text_color: str = "#312f2a",
     text_opacity: float = 1.0,
     wrap_text: bool = True,
+    text_rotation: int = 0,
     dpi: int | None = None,
 ) -> Image.Image:
     """Ajoute une textbox sur l'image.
@@ -368,6 +369,7 @@ def add_textbox(
         text_color:     Couleur du texte.
         text_opacity:   Opacite du texte entre 0.0 et 1.0.
         wrap_text:      True = autorise retour a la ligne, False = force mono-ligne.
+        text_rotation:  Rotation du texte en degres (0, 90, 180, 270).
         dpi:            DPI a utiliser pour la conversion cm->px (auto si None).
 
     Returns:
@@ -439,15 +441,22 @@ def add_textbox(
     content_w = ix1 - ix0
     content_h = iy1 - iy0
 
+    rotation = int(text_rotation) % 360
+    if rotation not in {0, 90, 180, 270}:
+        raise ValueError("text_rotation must be one of: 0, 90, 180, 270")
+
+    # For vertical text, fitting constraints are swapped before rotation.
+    fit_w, fit_h = (content_h, content_w) if rotation in {90, 270} else (content_w, content_h)
+
     layout_align = "left" if text_align == "justify" else text_align
     if font_size is not None:
         forced_size = max(1, int(font_size))
         font = _load_font(font_path, forced_size)
         spacing = max(2, int(forced_size * 0.25))
-        wrapped = _truncate_text_to_box(draw, text, font, content_w, content_h, spacing, wrap_text=wrap_text)
+        wrapped = _truncate_text_to_box(draw, text, font, fit_w, fit_h, spacing, wrap_text=wrap_text)
     else:
         effective_max_font_size = (
-            max(min_font_size, int(max(content_w, content_h)))
+            max(min_font_size, int(max(fit_w, fit_h)))
             if max_font_size is None
             else max(min_font_size, int(max_font_size))
         )
@@ -455,8 +464,8 @@ def add_textbox(
             draw,
             text,
             font_path,
-            content_w,
-            content_h,
+            fit_w,
+            fit_h,
             min_font_size,
             effective_max_font_size,
             layout_align,
@@ -490,21 +499,58 @@ def add_textbox(
     if text_rgba is None:
         return img
 
+    # Render text into a sprite first, then rotate and place into the textbox.
     if text_align == "justify" and wrap_text:
+        sprite_w = max(1, fit_w)
+        sprite_h = max(1, th)
+        sprite = Image.new("RGBA", (sprite_w, sprite_h), (0, 0, 0, 0))
+        sprite_draw = ImageDraw.Draw(sprite)
         _draw_multiline_justified(
-            draw=draw,
+            draw=sprite_draw,
             lines=wrapped.split("\n"),
-            x=tx,
-            y=ty,
-            max_w=ix1 - ix0,
+            x=0,
+            y=-by0,
+            max_w=sprite_w,
             font=font,
             fill=text_rgba,
             spacing=spacing,
         )
-    elif wrap_text:
-        draw.multiline_text((tx, ty), wrapped, font=font, fill=text_rgba, spacing=spacing, align=layout_align)
     else:
-        draw.text((tx, ty), wrapped, font=font, fill=text_rgba)
+        sprite_w = max(1, tw)
+        sprite_h = max(1, th)
+        sprite = Image.new("RGBA", (sprite_w, sprite_h), (0, 0, 0, 0))
+        sprite_draw = ImageDraw.Draw(sprite)
+        if wrap_text:
+            sprite_draw.multiline_text(
+                (-bx0, -by0),
+                wrapped,
+                font=font,
+                fill=text_rgba,
+                spacing=spacing,
+                align=layout_align,
+            )
+        else:
+            sprite_draw.text((-bx0, -by0), wrapped, font=font, fill=text_rgba)
+
+    if rotation:
+        sprite = sprite.rotate(rotation, expand=True, resample=Image.Resampling.BICUBIC)
+
+    rw, rh = sprite.size
+    if layout_align == "center":
+        px = ix0 + (content_w - rw) // 2
+    elif layout_align == "right":
+        px = ix1 - rw
+    else:
+        px = ix0
+
+    if text_valign == "top":
+        py = iy0
+    elif text_valign == "bottom":
+        py = iy1 - rh
+    else:
+        py = iy0 + (content_h - rh) // 2
+
+    img.alpha_composite(sprite, (px, py))
 
     return img
 
