@@ -14,6 +14,7 @@ HorizontalAlign = Literal["left", "center", "right"]
 VerticalAlign = Literal["top", "center", "bottom"]
 TextAlign = Literal["left", "center", "right", "justify"]
 TextVerticalAlign = Literal["top", "center", "bottom"]
+ImageFitMode = Literal["stretch", "contain", "cover"]
 
 
 # ---------------------------------------------------------------------------
@@ -22,7 +23,6 @@ TextVerticalAlign = Literal["top", "center", "bottom"]
 
 def _cm_to_px(cm: float, dpi: int = DPI) -> int:
     return int(round((cm / 2.54) * dpi))
-
 
 def _load_font(font_path: str | None, size: int) -> ImageFont.ImageFont:
     if font_path and os.path.exists(font_path):
@@ -47,10 +47,8 @@ def _load_font(font_path: str | None, size: int) -> ImageFont.ImageFont:
     except OSError:
         return ImageFont.load_default()
 
-
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
-
 
 def _resolve_rgba(color: str | None, opacity: float) -> tuple[int, int, int, int] | None:
     if color is None:
@@ -65,6 +63,68 @@ def _resolve_rgba(color: str | None, opacity: float) -> tuple[int, int, int, int
         return (rgb[0], rgb[1], rgb[2], alpha)
     return (rgb[0], rgb[1], rgb[2], alpha)
 
+def _load_rgba_image(source: str | Path | Image.Image) -> Image.Image:
+    if isinstance(source, Image.Image):
+        return source.convert("RGBA")
+    with Image.open(source) as opened:
+        return opened.convert("RGBA")
+
+def _apply_image_opacity(image: Image.Image, opacity: float) -> Image.Image:
+    alpha_factor = _clamp01(opacity)
+    if alpha_factor >= 1.0:
+        return image
+    result = image.copy()
+    alpha = result.getchannel("A")
+    alpha = alpha.point(lambda value: int(round(value * alpha_factor)))
+    result.putalpha(alpha)
+    return result
+
+def _resize_image_to_box(
+    source: Image.Image,
+    target_w: int,
+    target_h: int,
+    fit_mode: ImageFitMode,
+    align: HorizontalAlign,
+    valign: VerticalAlign,
+) -> Image.Image:
+    if target_w <= 0 or target_h <= 0:
+        return Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+
+    src_w, src_h = source.size
+    if src_w <= 0 or src_h <= 0:
+        return Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+
+    fit_mode = str(fit_mode).lower()
+    if fit_mode not in {"stretch", "contain", "cover"}:
+        raise ValueError("image_fit must be one of: stretch, contain, cover")
+
+    if fit_mode == "stretch":
+        return source.resize((target_w, target_h), resample=Image.Resampling.LANCZOS)
+
+    scale_x = target_w / src_w
+    scale_y = target_h / src_h
+    scale = min(scale_x, scale_y) if fit_mode == "contain" else max(scale_x, scale_y)
+    resized_w = max(1, int(round(src_w * scale)))
+    resized_h = max(1, int(round(src_h * scale)))
+    resized = source.resize((resized_w, resized_h), resample=Image.Resampling.LANCZOS)
+
+    canvas = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+    if align == "center":
+        offset_x = (target_w - resized_w) // 2
+    elif align == "right":
+        offset_x = target_w - resized_w
+    else:
+        offset_x = 0
+
+    if valign == "center":
+        offset_y = (target_h - resized_h) // 2
+    elif valign == "bottom":
+        offset_y = target_h - resized_h
+    else:
+        offset_y = 0
+
+    canvas.alpha_composite(resized, (offset_x, offset_y))
+    return canvas
 
 def _wrap_text(
     draw: ImageDraw.ImageDraw,
@@ -108,7 +168,6 @@ def _wrap_text(
         lines.append(current)
 
     return "\n".join(lines)
-
 
 def _fit_text(
     draw: ImageDraw.ImageDraw,
@@ -165,7 +224,6 @@ def _fit_text(
 
     return font, "", spacing
 
-
 def _truncate_text_to_box(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -188,7 +246,6 @@ def _truncate_text_to_box(
         if candidate:
             candidate = candidate + "..."
     return ""
-
 
 def _draw_multiline_justified(
     draw: ImageDraw.ImageDraw,
@@ -244,7 +301,7 @@ def _draw_multiline_justified(
 
 
 # ---------------------------------------------------------------------------
-# 1. Creer un poster vierge
+# Drawing functions
 # ---------------------------------------------------------------------------
 
 def create_blank_poster(
@@ -270,11 +327,6 @@ def create_blank_poster(
     img.info["dpi"] = dpi
     return img
 
-
-# ---------------------------------------------------------------------------
-# 2. Changer la couleur de fond
-# ---------------------------------------------------------------------------
-
 def set_background(
     img: Image.Image,
     color: str = "#ffffff",
@@ -295,11 +347,6 @@ def set_background(
         # Conserve le contenu existant au-dessus du nouveau fond.
         bg.alpha_composite(img.convert("RGBA"))
     return bg
-
-
-# ---------------------------------------------------------------------------
-# 3. Ajouter une textbox
-# ---------------------------------------------------------------------------
 
 def add_textbox(
     img: Image.Image,
@@ -550,6 +597,265 @@ def add_textbox(
     else:
         py = iy0 + (content_h - rh) // 2
 
+    img.alpha_composite(sprite, (px, py))
+
+    return img
+
+def add_shape(
+    img: Image.Image,
+    width_cm: float = 8.0,
+    height_cm: float = 4.0,
+    x_cm: float | HorizontalAlign | None = "center",
+    y_cm: float | VerticalAlign | None = "center",
+    margin_x_cm: float | None = None,
+    margin_y_cm: float | None = None,
+    margin_cm: float = 0.0,
+    bg_color: str = "#ffffff",
+    bg_opacity: float = 1.0,
+    border_color: str | None = "#b8b5ab",
+    border_opacity: float = 1.0,
+    border_width: int = 2,
+    shape_rotation: int = 0,
+    dpi: int | None = None,
+) -> Image.Image:
+    """Ajoute une forme rectangulaire (carré/rectangle) sur l'image.
+
+    Les dimensions et coordonnees sont en centimetres.
+    La position x_cm/y_cm accepte:
+    - un float en cm (coin haut-gauche de la forme)
+    - 'left' / 'center' / 'right'  pour x_cm
+    - 'top' / 'center' / 'bottom'  pour y_cm
+
+    La marge est configurable separement en X/Y via margin_x_cm et margin_y_cm.
+    Si non fournis, margin_cm est utilise pour les deux axes.
+
+    Args:
+        img:            Image PIL cible (modifiee en place).
+        width_cm:       Largeur de la forme en cm.
+        height_cm:      Hauteur de la forme en cm.
+        x_cm:           Position horizontale en cm, ou 'left'/'center'/'right'.
+        y_cm:           Position verticale en cm, ou 'top'/'center'/'bottom'.
+        margin_x_cm:    Marge horizontale entre la forme et les bords (cm).
+        margin_y_cm:    Marge verticale entre la forme et les bords (cm).
+        margin_cm:      Marge legacy appliquee aux deux axes si margin_x_cm/y_cm absents.
+        bg_color:       Couleur de remplissage de la forme.
+        bg_opacity:     Opacite du remplissage entre 0.0 et 1.0.
+        border_color:   Couleur de la bordure (None = pas de bordure).
+        border_opacity: Opacite de la bordure entre 0.0 et 1.0.
+        border_width:   Epaisseur de la bordure en pixels.
+        shape_rotation: Rotation de la forme en degres (0, 90, 180, 270).
+        dpi:            DPI a utiliser pour la conversion cm->px (auto si None).
+
+    Returns:
+        La meme image modifiee.
+    """
+    resolved_dpi: int = dpi if dpi is not None else int(img.info.get("dpi", DPI))
+    pw, ph = img.size
+
+    shape_w = min(_cm_to_px(width_cm, resolved_dpi), pw)
+    shape_h = min(_cm_to_px(height_cm, resolved_dpi), ph)
+    mx_cm = margin_cm if margin_x_cm is None else margin_x_cm
+    my_cm = margin_cm if margin_y_cm is None else margin_y_cm
+    margin_x_px = _cm_to_px(mx_cm, resolved_dpi)
+    margin_y_px = _cm_to_px(my_cm, resolved_dpi)
+
+    # --- Position horizontale ---
+    if x_cm == "left" or x_cm is None:
+        x0 = margin_x_px
+    elif x_cm == "center":
+        x0 = (pw - shape_w) // 2
+    elif x_cm == "right":
+        x0 = pw - shape_w - margin_x_px
+    else:
+        x0 = _cm_to_px(float(x_cm), resolved_dpi)
+
+    # --- Position verticale ---
+    if y_cm == "top" or y_cm is None:
+        y0 = margin_y_px
+    elif y_cm == "center":
+        y0 = (ph - shape_h) // 2
+    elif y_cm == "bottom":
+        y0 = ph - shape_h - margin_y_px
+    else:
+        y0 = _cm_to_px(float(y_cm), resolved_dpi)
+
+    # Clamping dans les bornes
+    x0 = max(margin_x_px, min(x0, pw - shape_w - margin_x_px))
+    y0 = max(margin_y_px, min(y0, ph - shape_h - margin_y_px))
+    x1 = x0 + shape_w
+    y1 = y0 + shape_h
+
+    # Validation de la rotation
+    rotation = int(shape_rotation) % 360
+    if rotation not in {0, 90, 180, 270}:
+        raise ValueError("shape_rotation must be one of: 0, 90, 180, 270")
+
+    # Si pas de rotation, dessine directement
+    if rotation == 0:
+        draw = ImageDraw.Draw(img)
+        fill_rgba = _resolve_rgba(bg_color, bg_opacity)
+        border_rgba = _resolve_rgba(border_color, border_opacity)
+        
+        if fill_rgba is not None:
+            draw.rectangle((x0, y0, x1, y1), fill=fill_rgba)
+        if border_rgba and border_width > 0:
+            draw.rectangle((x0, y0, x1, y1), outline=border_rgba, width=border_width)
+        
+        return img
+
+    # Sinon, cree un sprite et le rotate
+    fill_rgba = _resolve_rgba(bg_color, bg_opacity)
+    border_rgba = _resolve_rgba(border_color, border_opacity)
+    
+    # Cree le sprite de la forme
+    sprite = Image.new("RGBA", (shape_w, shape_h), (0, 0, 0, 0))
+    sprite_draw = ImageDraw.Draw(sprite)
+    
+    # Dessine la forme dans le sprite
+    if fill_rgba is not None:
+        sprite_draw.rectangle((0, 0, shape_w - 1, shape_h - 1), fill=fill_rgba)
+    if border_rgba and border_width > 0:
+        sprite_draw.rectangle((0, 0, shape_w - 1, shape_h - 1), outline=border_rgba, width=border_width)
+    
+    # Rotate le sprite
+    sprite = sprite.rotate(rotation, expand=True, resample=Image.Resampling.BICUBIC)
+    
+    # Reposition apres rotation pour garder le centre
+    rw, rh = sprite.size
+    px = x0 + (shape_w - rw) // 2
+    py = y0 + (shape_h - rh) // 2
+    
+    # Composite sur l'image
+    img.alpha_composite(sprite, (px, py))
+    
+    return img
+
+def add_image_shape(
+    img: Image.Image,
+    photo: str | Path | Image.Image,
+    width_cm: float = 8.0,
+    height_cm: float = 4.0,
+    x_cm: float | HorizontalAlign | None = "center",
+    y_cm: float | VerticalAlign | None = "center",
+    margin_x_cm: float | None = None,
+    margin_y_cm: float | None = None,
+    margin_cm: float = 0.0,
+    padding_cm: float = 0.0,
+    bg_color: str = "transparent",
+    bg_opacity: float = 1.0,
+    border_color: str | None = "#b8b5ab",
+    border_opacity: float = 1.0,
+    border_width: int = 2,
+    image_fit: ImageFitMode = "cover",
+    image_align: HorizontalAlign = "center",
+    image_valign: VerticalAlign = "center",
+    image_opacity: float = 1.0,
+    shape_rotation: int = 0,
+    dpi: int | None = None,
+) -> Image.Image:
+    """Ajoute une forme rectangulaire remplie par une image.
+
+    Les dimensions et coordonnees sont en centimetres.
+    La forme est rectangulaire, avec les memes regles de placement que add_shape.
+
+    Le contenu image supporte trois modes:
+    - stretch: deforme l'image pour remplir exactement la zone
+    - contain: fait rentrer toute l'image sans deformation, avec marge visible si besoin
+    - cover: remplit toute la zone sans deformation, avec crop si besoin
+
+    Args:
+        img:            Image PIL cible (modifiee en place).
+        photo:          Chemin vers une image ou instance PIL.Image.Image.
+        width_cm:       Largeur de la forme en cm.
+        height_cm:      Hauteur de la forme en cm.
+        x_cm:           Position horizontale en cm, ou 'left'/'center'/'right'.
+        y_cm:           Position verticale en cm, ou 'top'/'center'/'bottom'.
+        margin_x_cm:    Marge horizontale entre la forme et les bords (cm).
+        margin_y_cm:    Marge verticale entre la forme et les bords (cm).
+        margin_cm:      Marge legacy appliquee aux deux axes si margin_x_cm/y_cm absents.
+        padding_cm:     Espace interne entre la bordure et l'image.
+        bg_color:       Couleur de fond visible autour de l'image en mode contain.
+        bg_opacity:     Opacite du fond entre 0.0 et 1.0.
+        border_color:   Couleur de la bordure (None = pas de bordure).
+        border_opacity: Opacite de la bordure entre 0.0 et 1.0.
+        border_width:   Epaisseur de la bordure en pixels.
+        image_fit:      'stretch', 'contain' ou 'cover'.
+        image_align:    Alignement horizontal de l'image: 'left', 'center', 'right'.
+        image_valign:   Alignement vertical de l'image: 'top', 'center', 'bottom'.
+        image_opacity:  Opacite appliquee a l'image entre 0.0 et 1.0.
+        shape_rotation: Rotation de la forme en degres (0, 90, 180, 270).
+        dpi:            DPI a utiliser pour la conversion cm->px (auto si None).
+
+    Returns:
+        La meme image modifiee.
+    """
+    resolved_dpi: int = dpi if dpi is not None else int(img.info.get("dpi", DPI))
+    pw, ph = img.size
+
+    shape_w = min(_cm_to_px(width_cm, resolved_dpi), pw)
+    shape_h = min(_cm_to_px(height_cm, resolved_dpi), ph)
+    mx_cm = margin_cm if margin_x_cm is None else margin_x_cm
+    my_cm = margin_cm if margin_y_cm is None else margin_y_cm
+    margin_x_px = _cm_to_px(mx_cm, resolved_dpi)
+    margin_y_px = _cm_to_px(my_cm, resolved_dpi)
+
+    if x_cm == "left" or x_cm is None:
+        x0 = margin_x_px
+    elif x_cm == "center":
+        x0 = (pw - shape_w) // 2
+    elif x_cm == "right":
+        x0 = pw - shape_w - margin_x_px
+    else:
+        x0 = _cm_to_px(float(x_cm), resolved_dpi)
+
+    if y_cm == "top" or y_cm is None:
+        y0 = margin_y_px
+    elif y_cm == "center":
+        y0 = (ph - shape_h) // 2
+    elif y_cm == "bottom":
+        y0 = ph - shape_h - margin_y_px
+    else:
+        y0 = _cm_to_px(float(y_cm), resolved_dpi)
+
+    x0 = max(margin_x_px, min(x0, pw - shape_w - margin_x_px))
+    y0 = max(margin_y_px, min(y0, ph - shape_h - margin_y_px))
+
+    rotation = int(shape_rotation) % 360
+    if rotation not in {0, 90, 180, 270}:
+        raise ValueError("shape_rotation must be one of: 0, 90, 180, 270")
+
+    fill_rgba = _resolve_rgba(bg_color, bg_opacity)
+    border_rgba = _resolve_rgba(border_color, border_opacity)
+    padding_px = _cm_to_px(padding_cm, resolved_dpi)
+
+    sprite = Image.new("RGBA", (shape_w, shape_h), (0, 0, 0, 0))
+    sprite_draw = ImageDraw.Draw(sprite)
+
+    if fill_rgba is not None:
+        sprite_draw.rectangle((0, 0, shape_w - 1, shape_h - 1), fill=fill_rgba)
+
+    inner_x0 = padding_px
+    inner_y0 = padding_px
+    inner_x1 = shape_w - padding_px
+    inner_y1 = shape_h - padding_px
+    inner_w = inner_x1 - inner_x0
+    inner_h = inner_y1 - inner_y0
+
+    if inner_w > 0 and inner_h > 0:
+        source = _load_rgba_image(photo)
+        source = _apply_image_opacity(source, image_opacity)
+        placed = _resize_image_to_box(source, inner_w, inner_h, image_fit, image_align, image_valign)
+        sprite.alpha_composite(placed, (inner_x0, inner_y0))
+
+    if border_rgba and border_width > 0:
+        sprite_draw.rectangle((0, 0, shape_w - 1, shape_h - 1), outline=border_rgba, width=border_width)
+
+    if rotation:
+        sprite = sprite.rotate(rotation, expand=True, resample=Image.Resampling.BICUBIC)
+
+    rw, rh = sprite.size
+    px = x0 + (shape_w - rw) // 2
+    py = y0 + (shape_h - rh) // 2
     img.alpha_composite(sprite, (px, py))
 
     return img
