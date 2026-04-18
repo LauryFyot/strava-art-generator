@@ -1,0 +1,58 @@
+{
+  "poster": {
+    "width": 1400,
+    "height": 2000,
+    "background": "#f7f5ef",
+    "frame_color": "#b8b5ab",
+    "frame_width": 3,
+    "margin": 48
+  },
+  "map": {
+    "padding": 0.12,
+    "route_color": "#d6511f",
+    "route_width": 8,
+    "route_glow_color": "#f7f5ef",
+    "route_glow_width": 16,
+    "start_color": "#2fbf5b",
+    "end_color": "#111111",
+    "point_outline_color": "#f7f5ef",
+    "point_outline_width": 4,
+    "point_radius": 10,
+    "tile_url_template": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "tile_zoom": null,
+    "style": {
+      "desaturate": 0.35,
+      "contrast": 1.18,
+      "brightness": 1.03,
+      "blur_radius": 0.6,
+      "tint_color": "#dfe9d8",
+      "tint_strength": 0.18,
+      "vignette_strength": 0.15,
+      "grain_strength": 0.045,
+      "grain_seed": 42
+    }
+  },
+  "typography": {
+    "font_path": null,
+    "title_size": 96,
+    "subtitle_size": 36,
+    "metric_value_size": 40,
+    "metric_label_size": 24,
+    "small_size": 20,
+    "title_color": "#3d2b8f",
+    "text_color": "#312f2a",
+    "muted_color": "#7a766d"
+  },
+  "layout": {
+    "title_strip_width": 180,
+    "map_height_ratio": 0.64,
+    "stats_height": 160,
+    "profile_height": 170,
+    "section_gap": 30
+  },
+  "profile": {
+    "fill_color": "#b7adc9",
+    "line_color": "#8a7cb0",
+    "grid_color": "#d8d4ca"
+  }
+}

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / Editor
+.DS_Store
+.vscode/
+
+# Generated images and local artifacts
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Build / temp
+build/
+dist/
+*.egg-info/
+*.log
