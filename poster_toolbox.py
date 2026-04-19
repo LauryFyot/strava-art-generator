@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
+from urllib.request import Request, urlopen
+from io import BytesIO
 
-from PIL import Image, ImageColor, ImageDraw, ImageFont
+from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageEnhance
 
 
 DPI = 300
@@ -125,6 +128,84 @@ def _resize_image_to_box(
 
     canvas.alpha_composite(resized, (offset_x, offset_y))
     return canvas
+
+def _get_point_value(point: Any, name: str, index: int, default: float = 0.0) -> float:
+    value: Any = default
+    if hasattr(point, name):
+        value = getattr(point, name)
+    elif isinstance(point, dict):
+        value = point.get(name, default)
+    elif isinstance(point, (list, tuple)) and len(point) > index:
+        value = point[index]
+    if value is None:
+        return float(default)
+    return float(value)
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    earth_radius_m = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = (
+        math.sin(delta_phi / 2.0) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
+    )
+    return 2.0 * earth_radius_m * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+
+def _moving_average(values: list[float], window: int) -> list[float]:
+    if window <= 1 or len(values) <= 2:
+        return values[:]
+
+    radius = max(0, window // 2)
+    smoothed: list[float] = []
+    for idx in range(len(values)):
+        start = max(0, idx - radius)
+        end = min(len(values), idx + radius + 1)
+        chunk = values[start:end]
+        smoothed.append(sum(chunk) / len(chunk))
+    return smoothed
+
+def _compute_box_rect(
+    img: Image.Image,
+    width_cm: float,
+    height_cm: float,
+    x_cm: float | HorizontalAlign | None,
+    y_cm: float | VerticalAlign | None,
+    margin_x_cm: float | None,
+    margin_y_cm: float | None,
+    margin_cm: float,
+    dpi: int,
+) -> tuple[int, int, int, int]:
+    pw, ph = img.size
+    box_w = min(_cm_to_px(width_cm, dpi), pw)
+    box_h = min(_cm_to_px(height_cm, dpi), ph)
+    mx_cm = margin_cm if margin_x_cm is None else margin_x_cm
+    my_cm = margin_cm if margin_y_cm is None else margin_y_cm
+    margin_x_px = _cm_to_px(mx_cm, dpi)
+    margin_y_px = _cm_to_px(my_cm, dpi)
+
+    if x_cm == "left" or x_cm is None:
+        x0 = margin_x_px
+    elif x_cm == "center":
+        x0 = (pw - box_w) // 2
+    elif x_cm == "right":
+        x0 = pw - box_w - margin_x_px
+    else:
+        x0 = _cm_to_px(float(x_cm), dpi)
+
+    if y_cm == "top" or y_cm is None:
+        y0 = margin_y_px
+    elif y_cm == "center":
+        y0 = (ph - box_h) // 2
+    elif y_cm == "bottom":
+        y0 = ph - box_h - margin_y_px
+    else:
+        y0 = _cm_to_px(float(y_cm), dpi)
+
+    x0 = max(margin_x_px, min(x0, pw - box_w - margin_x_px))
+    y0 = max(margin_y_px, min(y0, ph - box_h - margin_y_px))
+    return (x0, y0, x0 + box_w, y0 + box_h)
 
 def _wrap_text(
     draw: ImageDraw.ImageDraw,
@@ -858,6 +939,449 @@ def add_image_shape(
     py = y0 + (shape_h - rh) // 2
     img.alpha_composite(sprite, (px, py))
 
+    return img
+
+def elevation_v1(
+    img: Image.Image,
+    points: list[Any],
+    width_cm: float = 10.0,
+    height_cm: float = 4.0,
+    x_cm: float | HorizontalAlign | None = "center",
+    y_cm: float | VerticalAlign | None = "center",
+    margin_x_cm: float | None = None,
+    margin_y_cm: float | None = None,
+    margin_cm: float = 0.0,
+    padding_cm: float = 0.25,
+    title: str | None = None,
+    subtitle: str | None = None,
+    font_path: str | None = None,
+    title_color: str = "#7e77aa",
+    text_color: str = "#7a766d",
+    axis_text_color: str | None = None,
+    x_text_size: int | None = None,
+    y_text_size: int | None = None,
+    bg_color: str = "#f5f1e6",
+    bg_opacity: float = 1.0,
+    border_color: str | None = "#b8b5ab",
+    border_opacity: float = 1.0,
+    border_width: int = 2,
+    grid_color: str = "#d8d4ca",
+    grid_line_color: str | None = None,
+    grid_opacity: float = 1.0,
+    grid_rows: int = 4,
+    grid_cols: int = 6,
+    skip_min_x_label: bool = True,
+    skip_min_y_label: bool = True,
+    x_label_gap_cm: float = 0.1,
+    y_label_gap_cm: float = 0.1,
+    fill_color: str = "#b7adc9",
+    fill_opacity: float = 0.9,
+    elevation_opacity: float | None = None,
+    fill_top_color: str | None = None,
+    fill_top_opacity: float | None = None,
+    line_color: str = "#8a7cb0",
+    line_opacity: float = 1.0,
+    line_width: int = 3,
+    smooth_window: int = 9,
+    dpi: int | None = None,
+) -> Image.Image:
+    """Dessine un profil d'elevation dans une boite style affiche.
+
+    La fonction attend une liste de points GPX avec au minimum un attribut `ele`.
+    Si les points contiennent aussi `lat` et `lon`, l'axe X est calcule en distance reelle.
+    Sinon, la progression se fait simplement par index.
+    """
+    resolved_dpi: int = dpi if dpi is not None else int(img.info.get("dpi", DPI))
+    x0, y0, x1, y1 = _compute_box_rect(
+        img,
+        width_cm,
+        height_cm,
+        x_cm,
+        y_cm,
+        margin_x_cm,
+        margin_y_cm,
+        margin_cm,
+        resolved_dpi,
+    )
+
+    draw = ImageDraw.Draw(img)
+    fill_rgba = _resolve_rgba(bg_color, bg_opacity)
+    border_rgba = _resolve_rgba(border_color, border_opacity)
+    if fill_rgba is not None:
+        draw.rectangle((x0, y0, x1, y1), fill=fill_rgba)
+    if border_rgba and border_width > 0:
+        draw.rectangle((x0, y0, x1, y1), outline=border_rgba, width=border_width)
+
+    if len(points) < 2:
+        return img
+
+    padding_px = _cm_to_px(padding_cm, resolved_dpi)
+    content_x0 = x0 + padding_px
+    content_y0 = y0 + padding_px
+    content_x1 = x1 - padding_px
+    content_y1 = y1 - padding_px
+    if content_x1 <= content_x0 or content_y1 <= content_y0:
+        return img
+
+    box_h = y1 - y0
+    title_size = max(14, int(round(box_h * 0.12)))
+    base_label_size = max(11, int(round(box_h * 0.08)))
+    resolved_x_text_size = base_label_size if x_text_size is None else max(8, int(x_text_size))
+    resolved_y_text_size = base_label_size if y_text_size is None else max(8, int(y_text_size))
+    title_font = _load_font(font_path, title_size)
+    x_label_font = _load_font(font_path, resolved_x_text_size)
+    y_label_font = _load_font(font_path, resolved_y_text_size)
+    subtitle_font = _load_font(font_path, max(resolved_x_text_size, resolved_y_text_size))
+
+    effective_grid_color = grid_line_color if grid_line_color is not None else grid_color
+    effective_fill_opacity = fill_opacity if elevation_opacity is None else elevation_opacity
+    effective_text_color = axis_text_color if axis_text_color is not None else text_color
+
+    title_rgba = _resolve_rgba(title_color, 1.0)
+    text_rgba = _resolve_rgba(effective_text_color, 1.0)
+    grid_rgba = _resolve_rgba(effective_grid_color, grid_opacity)
+    fill_profile_rgba = _resolve_rgba(fill_color, effective_fill_opacity)
+    fill_top_rgba = _resolve_rgba(fill_top_color, fill_top_opacity if fill_top_opacity is not None else effective_fill_opacity)
+    line_rgba = _resolve_rgba(line_color, line_opacity)
+
+    title_h = 0
+    if title:
+        title_bbox = draw.textbbox((0, 0), title, font=title_font)
+        title_h = title_bbox[3] - title_bbox[1]
+        if title_rgba is not None:
+            draw.text((content_x0, content_y0), title, font=title_font, fill=title_rgba)
+
+    if subtitle and text_rgba is not None:
+        subtitle_bbox = draw.textbbox((0, 0), subtitle, font=subtitle_font)
+        subtitle_w = subtitle_bbox[2] - subtitle_bbox[0]
+        draw.text((content_x1 - subtitle_w, content_y0 + 1), subtitle, font=subtitle_font, fill=text_rgba)
+
+    y_label_sample = draw.textbbox((0, 0), "0000m", font=y_label_font)
+    x_label_sample = draw.textbbox((0, 0), "00.0km", font=x_label_font)
+    y_label_w = (y_label_sample[2] - y_label_sample[0]) + max(8, int(round(box_h * 0.02)))
+    x_label_h = (x_label_sample[3] - x_label_sample[1]) + max(8, int(round(box_h * 0.03)))
+    plot_x0 = content_x0 + y_label_w
+    plot_y0 = content_y0 + title_h + max(10, int(round(box_h * 0.04)))
+    plot_x1 = content_x1
+    plot_y1 = content_y1 - x_label_h
+    plot_w = plot_x1 - plot_x0
+    plot_h = plot_y1 - plot_y0
+    if plot_w <= 4 or plot_h <= 4:
+        return img
+
+    elevations = [_get_point_value(point, "ele", 2, 0.0) for point in points]
+    smoothed_elevations = _moving_average(elevations, smooth_window)
+
+    distances_m: list[float] = [0.0]
+    can_use_geo = all(
+        hasattr(point, "lat") and hasattr(point, "lon")
+        or (isinstance(point, dict) and "lat" in point and "lon" in point)
+        or (isinstance(point, (list, tuple)) and len(point) >= 2)
+        for point in points
+    )
+    if can_use_geo:
+        total = 0.0
+        for p1, p2 in zip(points[:-1], points[1:]):
+            lat1 = _get_point_value(p1, "lat", 0, 0.0)
+            lon1 = _get_point_value(p1, "lon", 1, 0.0)
+            lat2 = _get_point_value(p2, "lat", 0, 0.0)
+            lon2 = _get_point_value(p2, "lon", 1, 0.0)
+            total += _haversine_m(lat1, lon1, lat2, lon2)
+            distances_m.append(total)
+    else:
+        distances_m = [float(index) for index in range(len(points))]
+
+    min_ele = min(smoothed_elevations)
+    max_ele = max(smoothed_elevations)
+    if math.isclose(min_ele, max_ele):
+        min_ele -= 1.0
+        max_ele += 1.0
+    span_ele = max_ele - min_ele
+    total_distance = max(distances_m[-1], 1.0)
+
+    if grid_rgba is not None:
+        for row in range(grid_rows + 1):
+            gy = plot_y0 + int(round((row / max(grid_rows, 1)) * plot_h))
+            draw.line([(plot_x0, gy), (plot_x1, gy)], fill=grid_rgba, width=1)
+        for col in range(grid_cols + 1):
+            gx = plot_x0 + int(round((col / max(grid_cols, 1)) * plot_w))
+            draw.line([(gx, plot_y0), (gx, plot_y1)], fill=grid_rgba, width=1)
+
+    profile_points: list[tuple[int, int]] = []
+    for distance_m, elevation_m in zip(distances_m, smoothed_elevations):
+        px = plot_x0 + int(round((distance_m / total_distance) * plot_w))
+        py = plot_y1 - int(round(((elevation_m - min_ele) / span_ele) * plot_h))
+        profile_points.append((px, py))
+
+    if len(profile_points) >= 2:
+        polygon = [(plot_x0, plot_y1)] + profile_points + [(plot_x1, plot_y1)]
+        if fill_profile_rgba is not None:
+            if fill_top_rgba is None:
+                draw.polygon(polygon, fill=fill_profile_rgba)
+            else:
+                local_w = max(1, plot_w + 1)
+                local_h = max(1, plot_h + 1)
+                gradient_layer = Image.new("RGBA", (local_w, local_h), (0, 0, 0, 0))
+                gradient_draw = ImageDraw.Draw(gradient_layer)
+                for y in range(local_h):
+                    ratio = y / max(local_h - 1, 1)
+                    r = int(round(fill_top_rgba[0] + (fill_profile_rgba[0] - fill_top_rgba[0]) * ratio))
+                    g = int(round(fill_top_rgba[1] + (fill_profile_rgba[1] - fill_top_rgba[1]) * ratio))
+                    b = int(round(fill_top_rgba[2] + (fill_profile_rgba[2] - fill_top_rgba[2]) * ratio))
+                    a = int(round(fill_top_rgba[3] + (fill_profile_rgba[3] - fill_top_rgba[3]) * ratio))
+                    gradient_draw.line([(0, y), (local_w, y)], fill=(r, g, b, a), width=1)
+
+                local_polygon = [(px - plot_x0, py - plot_y0) for px, py in polygon]
+                polygon_mask = Image.new("L", (local_w, local_h), 0)
+                mask_draw = ImageDraw.Draw(polygon_mask)
+                mask_draw.polygon(local_polygon, fill=255)
+
+                clipped = Image.new("RGBA", (local_w, local_h), (0, 0, 0, 0))
+                clipped.paste(gradient_layer, (0, 0), polygon_mask)
+                img.alpha_composite(clipped, (plot_x0, plot_y0))
+        if line_rgba is not None and line_width > 0:
+            draw.line(profile_points, fill=line_rgba, width=line_width)
+
+    if text_rgba is not None:
+        y_label_gap_px = int(round(_cm_to_px(y_label_gap_cm, resolved_dpi)))
+        x_label_gap_px = int(round(_cm_to_px(x_label_gap_cm, resolved_dpi)))
+        
+        for row in range(grid_rows + 1):
+            if skip_min_y_label and row == grid_rows:
+                continue
+            ratio = 1.0 - (row / max(grid_rows, 1))
+            value = min_ele + ratio * span_ele
+            label = f"{int(round(value))}m"
+            bbox = draw.textbbox((0, 0), label, font=y_label_font)
+            label_w = bbox[2] - bbox[0]
+            label_h = bbox[3] - bbox[1]
+            gy = plot_y0 + int(round((row / max(grid_rows, 1)) * plot_h)) - (label_h // 2)
+            draw.text((plot_x0 - label_w - y_label_gap_px, gy), label, font=y_label_font, fill=text_rgba)
+
+        for col in range(grid_cols + 1):
+            if skip_min_x_label and col == 0:
+                continue
+            ratio = col / max(grid_cols, 1)
+            value_km = (ratio * total_distance) / 1000.0
+            if total_distance >= 10000:
+                label = f"{value_km:.0f}km"
+            else:
+                label = f"{value_km:.1f}km"
+            bbox = draw.textbbox((0, 0), label, font=x_label_font)
+            label_w = bbox[2] - bbox[0]
+            gx = plot_x0 + int(round(ratio * plot_w)) - (label_w // 2)
+            draw.text((gx, plot_y1 + x_label_gap_px), label, font=x_label_font, fill=text_rgba)
+
+    return img
+
+
+# ---------------------------------------------------------------------------
+# Cartographie
+# ---------------------------------------------------------------------------
+
+def _lat_lon_to_tile(lat: float, lon: float, zoom: int) -> tuple[int, int]:
+    """Convertit lat/lon en index de tuile OSM."""
+    lat = max(min(lat, 85.05112878), -85.05112878)
+    n = 2.0 ** zoom
+    xtile = math.floor((lon + 180.0) / 360.0 * n)
+    ytile = math.floor(
+        (1.0 - math.log(math.tan(math.radians(lat)) + 1.0 / math.cos(math.radians(lat))) / math.pi)
+        / 2.0
+        * n
+    )
+    return int(xtile), int(ytile)
+
+
+def _lat_lon_to_world_px(lat: float, lon: float, zoom: int) -> tuple[float, float]:
+    """Convertit lat/lon en coordonnees pixel monde Web Mercator."""
+    lat = max(min(lat, 85.05112878), -85.05112878)
+    n = 2.0 ** zoom
+    x = ((lon + 180.0) / 360.0) * n * 256.0
+    y = (
+        (1.0 - math.log(math.tan(math.radians(lat)) + 1.0 / math.cos(math.radians(lat))) / math.pi)
+        / 2.0
+        * n
+        * 256.0
+    )
+    return x, y
+
+
+def _download_osm_tile(
+    x: int,
+    y: int,
+    zoom: int,
+    tile_server: str = "a.tile.openstreetmap.org",
+) -> Image.Image | None:
+    """Telecharge une tuile OSM 256x256 avec User-Agent."""
+    url = f"https://{tile_server}/{zoom}/{x}/{y}.png"
+    try:
+        req = Request(url, headers={"User-Agent": "strava-generator/1.0 (+local dev)"})
+        with urlopen(req, timeout=8) as response:
+            return Image.open(BytesIO(response.read())).convert("RGBA")
+    except Exception:
+        return None
+
+
+def add_map(
+    img: Image.Image,
+    points: list[Any],
+    width_cm: float = 10.0,
+    height_cm: float = 8.0,
+    x_cm: float | HorizontalAlign | None = "center",
+    y_cm: float | VerticalAlign | None = "center",
+    margin_x_cm: float | None = None,
+    margin_y_cm: float | None = None,
+    margin_cm: float = 0.0,
+    padding_cm: float = 0.25,
+    zoom: int | None = None,
+    bg_color: str = "#e6e3d6",
+    bg_opacity: float = 1.0,
+    border_color: str | None = "#999999",
+    border_opacity: float = 1.0,
+    border_width: int = 1,
+    trace_color: str = "#d62828",
+    trace_opacity: float = 1.0,
+    trace_width: int = 3,
+    style_contrast: float = 1.0,
+    style_brightness: float = 1.0,
+    dpi: int | None = None,
+) -> Image.Image:
+    """Ajoute une carte OSM stylisee avec le trace GPX."""
+    resolved_dpi = dpi if dpi is not None else int(img.info.get("dpi", DPI))
+    x0, y0, x1, y1 = _compute_box_rect(
+        img, width_cm, height_cm, x_cm, y_cm, margin_x_cm, margin_y_cm, margin_cm, resolved_dpi
+    )
+
+    box_w = x1 - x0
+    box_h = y1 - y0
+    if box_w <= 2 or box_h <= 2:
+        return img
+
+    geo_points: list[tuple[float, float]] = []
+    for p in points:
+        lat = _get_point_value(p, "lat", 0, 0.0)
+        lon = _get_point_value(p, "lon", 1, 0.0)
+        if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0 and not (lat == 0.0 and lon == 0.0):
+            geo_points.append((lat, lon))
+
+    if len(geo_points) < 2:
+        return img
+
+    lats = [lat for lat, _ in geo_points]
+    lons = [lon for _, lon in geo_points]
+    lat_min, lat_max = min(lats), max(lats)
+    lon_min, lon_max = min(lons), max(lons)
+
+    lat_pad = max((lat_max - lat_min) * 0.08, 0.002)
+    lon_pad = max((lon_max - lon_min) * 0.08, 0.002)
+    lat_min -= lat_pad
+    lat_max += lat_pad
+    lon_min -= lon_pad
+    lon_max += lon_pad
+
+    # Auto-zoom: evite de trop agrandir une petite zone (source de flou).
+    if zoom is None:
+        resolved_zoom = 13
+        for candidate_zoom in range(18, 2, -1):
+            tlx, tly = _lat_lon_to_world_px(lat_max, lon_min, candidate_zoom)
+            brx, bry = _lat_lon_to_world_px(lat_min, lon_max, candidate_zoom)
+            span_x = abs(brx - tlx)
+            span_y = abs(bry - tly)
+            if span_x >= box_w and span_y >= box_h:
+                resolved_zoom = candidate_zoom
+                break
+    else:
+        resolved_zoom = max(1, min(int(zoom), 19))
+
+    top_left_world = _lat_lon_to_world_px(lat_max, lon_min, resolved_zoom)
+    bottom_right_world = _lat_lon_to_world_px(lat_min, lon_max, resolved_zoom)
+
+    min_x = min(top_left_world[0], bottom_right_world[0])
+    max_x = max(top_left_world[0], bottom_right_world[0])
+    min_y = min(top_left_world[1], bottom_right_world[1])
+    max_y = max(top_left_world[1], bottom_right_world[1])
+
+    if max_x - min_x < 2 or max_y - min_y < 2:
+        return img
+
+    tile_min_x = int(math.floor(min_x / 256.0))
+    tile_max_x = int(math.floor(max_x / 256.0))
+    tile_min_y = int(math.floor(min_y / 256.0))
+    tile_max_y = int(math.floor(max_y / 256.0))
+
+    canvas_w = (tile_max_x - tile_min_x + 1) * 256
+    canvas_h = (tile_max_y - tile_min_y + 1) * 256
+    tile_canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+
+    servers = ["a.tile.openstreetmap.org", "b.tile.openstreetmap.org", "c.tile.openstreetmap.org"]
+    any_tile = False
+
+    for tx in range(tile_min_x, tile_max_x + 1):
+        for ty in range(tile_min_y, tile_max_y + 1):
+            tile = None
+            for server in servers:
+                tile = _download_osm_tile(tx, ty, resolved_zoom, server)
+                if tile is not None:
+                    break
+            if tile is not None:
+                any_tile = True
+                paste_x = (tx - tile_min_x) * 256
+                paste_y = (ty - tile_min_y) * 256
+                tile_canvas.paste(tile, (paste_x, paste_y))
+
+    crop_left = int(round(min_x - tile_min_x * 256.0))
+    crop_top = int(round(min_y - tile_min_y * 256.0))
+    crop_right = int(round(max_x - tile_min_x * 256.0))
+    crop_bottom = int(round(max_y - tile_min_y * 256.0))
+
+    crop_left = max(0, min(crop_left, canvas_w - 1))
+    crop_top = max(0, min(crop_top, canvas_h - 1))
+    crop_right = max(crop_left + 1, min(crop_right, canvas_w))
+    crop_bottom = max(crop_top + 1, min(crop_bottom, canvas_h))
+
+    map_crop = tile_canvas.crop((crop_left, crop_top, crop_right, crop_bottom))
+    map_resized = map_crop.resize((box_w, box_h), Image.Resampling.LANCZOS)
+
+    bg_rgba = _resolve_rgba(bg_color, bg_opacity)
+    if bg_rgba is None:
+        bg_rgba = (230, 227, 214, 255)
+    styled_bg = Image.new("RGBA", (box_w, box_h), bg_rgba)
+
+    if any_tile:
+        if style_contrast != 1.0:
+            map_resized = ImageEnhance.Contrast(map_resized).enhance(style_contrast)
+        if style_brightness != 1.0:
+            map_resized = ImageEnhance.Brightness(map_resized).enhance(style_brightness)
+        map_layer = Image.alpha_composite(styled_bg, map_resized.convert("RGBA"))
+    else:
+        map_layer = styled_bg
+        bg_draw = ImageDraw.Draw(map_layer)
+        step = max(24, int(round(min(box_w, box_h) * 0.06)))
+        line_col = (190, 186, 173, 140)
+        for xx in range(0, box_w, step):
+            bg_draw.line([(xx, 0), (xx, box_h)], fill=line_col, width=1)
+        for yy in range(0, box_h, step):
+            bg_draw.line([(0, yy), (box_w, yy)], fill=line_col, width=1)
+
+    draw = ImageDraw.Draw(map_layer)
+    trace_rgba = _resolve_rgba(trace_color, trace_opacity)
+    if trace_rgba is not None:
+        world_w = max_x - min_x
+        world_h = max_y - min_y
+        trace_px: list[tuple[int, int]] = []
+        for lat, lon in geo_points:
+            wx, wy = _lat_lon_to_world_px(lat, lon, resolved_zoom)
+            px = int(round(((wx - min_x) / world_w) * (box_w - 1)))
+            py = int(round(((wy - min_y) / world_h) * (box_h - 1)))
+            trace_px.append((px, py))
+        if len(trace_px) > 1:
+            draw.line(trace_px, fill=trace_rgba, width=max(1, int(trace_width)), joint="curve")
+
+    border_rgba = _resolve_rgba(border_color, border_opacity)
+    if border_rgba is not None and border_width > 0:
+        draw.rectangle((0, 0, box_w - 1, box_h - 1), outline=border_rgba, width=border_width)
+
+    img.alpha_composite(map_layer, (x0, y0))
     return img
 
 
