@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import math
+import importlib
 from pathlib import Path
 from typing import Any, Literal
 from urllib.request import Request, urlopen
@@ -1379,6 +1380,340 @@ def add_map(
 
     border_rgba = _resolve_rgba(border_color, border_opacity)
     if border_rgba is not None and border_width > 0:
+        draw.rectangle((0, 0, box_w - 1, box_h - 1), outline=border_rgba, width=border_width)
+
+    img.alpha_composite(map_layer, (x0, y0))
+    return img
+
+
+def _render_osmnx_graph_image(
+    graph: Any,
+    width_px: int,
+    height_px: int,
+    dpi: int,
+    bgcolor: str,
+    edge_colors: list[str],
+    edge_widths: list[float],
+    edge_alpha: float = 1.0,
+) -> tuple[Image.Image, float, float, float, float]:
+    """Rend un graph OSMnx en image PIL RGBA sans fenetre interactive.
+
+    Retourne (image, west, east, south, north) — les limites reelles des axes matplotlib,
+    a utiliser pour projeter des coordonnees lat/lon sur l'image.
+    """
+    try:
+        ox = importlib.import_module("osmnx")
+    except ImportError as exc:
+        raise ImportError("osmnx est requis pour add_map_v1/add_map_v2") from exc
+
+    try:
+        plt = importlib.import_module("matplotlib.pyplot")
+    except ImportError as exc:
+        raise ImportError("matplotlib est requis pour add_map_v1/add_map_v2") from exc
+
+    fig_w = max(1.0, float(width_px) / max(dpi, 1))
+    fig_h = max(1.0, float(height_px) / max(dpi, 1))
+
+    fig, ax = ox.plot_graph(
+        graph,
+        node_size=0,
+        figsize=(fig_w, fig_h),
+        dpi=dpi,
+        bgcolor=bgcolor,
+        show=False,
+        save=False,
+        edge_color=edge_colors,
+        edge_linewidth=edge_widths,
+        edge_alpha=edge_alpha,
+    )
+
+    # Capturer les limites reelles AVANT tight_layout (ne les change pas)
+    render_west, render_east = ax.get_xlim()   # lon
+    render_south, render_north = ax.get_ylim() # lat
+
+    fig.tight_layout(pad=0)
+    buffer = BytesIO()
+    fig.savefig(
+        buffer,
+        format="png",
+        dpi=dpi,
+        bbox_inches="tight",
+        facecolor=fig.get_facecolor(),
+        transparent=False,
+    )
+    plt.close(fig)
+
+    buffer.seek(0)
+    with Image.open(buffer) as rendered:
+        image = rendered.convert("RGBA")
+    if image.size != (width_px, height_px):
+        image = image.resize((width_px, height_px), Image.Resampling.LANCZOS)
+    return image, render_west, render_east, render_south, render_north
+
+
+def add_map_v1(
+    img: Image.Image,
+    points: list[Any] | None = None,
+    center_point: tuple[float, float] | None = None,
+    dist_m: int | None = None,
+    map_padding: float = 0.15,
+    network_type: str = "all",
+    width_cm: float = 10.0,
+    height_cm: float = 8.0,
+    x_cm: float | HorizontalAlign | None = "center",
+    y_cm: float | VerticalAlign | None = "center",
+    margin_x_cm: float | None = None,
+    margin_y_cm: float | None = None,
+    margin_cm: float = 0.0,
+    bg_color: str = "#061529",
+    color_short: str = "#a6a6a6",
+    color_medium: str = "#676767",
+    color_long: str = "#454545",
+    color_xlong: str = "#d5d5d5",
+    color_xxlong: str = "#ededed",
+    width_short: float = 0.10,
+    width_medium: float = 0.15,
+    width_long: float = 0.25,
+    width_xlong: float = 0.35,
+    width_xxlong: float = 0.45,
+    len_short_m: float = 100.0,
+    len_medium_m: float = 200.0,
+    len_long_m: float = 400.0,
+    len_xlong_m: float = 800.0,
+    trace_color: str | None = "#d62828",
+    trace_opacity: float = 1.0,
+    trace_width: int = 3,
+    trace_points: list[Any] | None = None,
+    border_color: str | None = None,
+    border_opacity: float = 1.0,
+    border_width: int = 0,
+    dpi: int | None = None,
+) -> Image.Image:
+    """Ajoute une carte type routes (style beautifulMaps/createMapRoads.py).
+
+    Passe soit ``points`` (liste de points GPX — le centre est calcule automatiquement),
+    soit ``center_point`` (tuple (lat, lon) explicite).
+    """
+    resolved_dpi = dpi if dpi is not None else int(img.info.get("dpi", DPI))
+    x0, y0, x1, y1 = _compute_box_rect(
+        img, width_cm, height_cm, x_cm, y_cm, margin_x_cm, margin_y_cm, margin_cm, resolved_dpi
+    )
+    box_w = x1 - x0
+    box_h = y1 - y0
+    if box_w <= 2 or box_h <= 2:
+        return img
+
+    if center_point is not None:
+        resolved_center = center_point
+        geo = []
+    elif points:
+        geo = [
+            (_get_point_value(p, "lat", 0, 0.0), _get_point_value(p, "lon", 1, 0.0))
+            for p in points
+            if not (_get_point_value(p, "lat", 0, 0.0) == 0.0 and _get_point_value(p, "lon", 1, 0.0) == 0.0)
+        ]
+        if not geo:
+            return img
+        resolved_center = (
+            (min(lat for lat, _ in geo) + max(lat for lat, _ in geo)) / 2.0,
+            (min(lon for _, lon in geo) + max(lon for _, lon in geo)) / 2.0,
+        )
+    else:
+        raise ValueError("add_map_v1: passe 'points' (GPX) ou 'center_point' (lat, lon).")
+
+    # Auto-calcul du dist_m depuis l'etendue de la trace si non specifie
+    if dist_m is None:
+        if geo:
+            lat_span_m = (max(lat for lat, _ in geo) - min(lat for lat, _ in geo)) * 111320
+            lon_span_m = (
+                (max(lon for _, lon in geo) - min(lon for _, lon in geo))
+                * 111320
+                * math.cos(math.radians(resolved_center[0]))
+            )
+            half_diag = math.sqrt(lat_span_m ** 2 + lon_span_m ** 2) / 2.0
+            resolved_dist_m = max(500, int(half_diag * (1.0 + map_padding * 2)))
+        else:
+            resolved_dist_m = 5000
+    else:
+        resolved_dist_m = max(100, int(dist_m))
+
+    try:
+        ox = importlib.import_module("osmnx")
+    except ImportError as exc:
+        raise ImportError("osmnx est requis pour add_map_v1") from exc
+
+    graph = ox.graph_from_point(
+        resolved_center,
+        dist=resolved_dist_m,
+        retain_all=True,
+        simplify=True,
+        network_type=network_type,
+    )
+
+    edge_colors: list[str] = []
+    edge_widths: list[float] = []
+    for _, _, _, attrs in graph.edges(keys=True, data=True):
+        length = float(attrs.get("length", 0.0))
+        if length <= len_short_m:
+            edge_colors.append(color_short)
+            edge_widths.append(width_short)
+        elif length <= len_medium_m:
+            edge_colors.append(color_medium)
+            edge_widths.append(width_medium)
+        elif length <= len_long_m:
+            edge_colors.append(color_long)
+            edge_widths.append(width_long)
+        elif length <= len_xlong_m:
+            edge_colors.append(color_xlong)
+            edge_widths.append(width_xlong)
+        else:
+            edge_colors.append(color_xxlong)
+            edge_widths.append(width_xxlong)
+
+    # _render_osmnx_graph_image retourne aussi les limites reelles des axes matplotlib
+    map_layer, render_west, render_east, render_south, render_north = _render_osmnx_graph_image(
+        graph=graph,
+        width_px=box_w,
+        height_px=box_h,
+        dpi=resolved_dpi,
+        bgcolor=bg_color,
+        edge_colors=edge_colors,
+        edge_widths=edge_widths,
+        edge_alpha=1.0,
+    )
+
+    # Trace GPX projetee avec les bornes reelles du rendu matplotlib (projection lineaire)
+    trace_rgba = _resolve_rgba(trace_color, trace_opacity)
+    if trace_rgba is not None:
+        geo_to_draw: list[tuple[float, float]] = [
+            (_get_point_value(p, "lat", 0, 0.0), _get_point_value(p, "lon", 1, 0.0))
+            for p in (trace_points if trace_points is not None else (points or []))
+            if not (_get_point_value(p, "lat", 0, 0.0) == 0.0 and _get_point_value(p, "lon", 1, 0.0) == 0.0)
+        ]
+        if len(geo_to_draw) >= 2:
+            lon_span = max(render_east - render_west, 1e-10)
+            lat_span = max(render_north - render_south, 1e-10)
+            trace_px: list[tuple[int, int]] = [
+                (
+                    int(round((lon - render_west) / lon_span * (box_w - 1))),
+                    int(round((render_north - lat) / lat_span * (box_h - 1))),
+                )
+                for lat, lon in geo_to_draw
+            ]
+            draw_layer = ImageDraw.Draw(map_layer)
+            draw_layer.line(trace_px, fill=trace_rgba, width=max(1, int(trace_width)), joint="curve")
+
+    border_rgba = _resolve_rgba(border_color, border_opacity)
+    if border_rgba is not None and border_width > 0:
+        draw = ImageDraw.Draw(map_layer)
+        draw.rectangle((0, 0, box_w - 1, box_h - 1), outline=border_rgba, width=border_width)
+
+    img.alpha_composite(map_layer, (x0, y0))
+    return img
+
+
+def add_map_v2(
+    img: Image.Image,
+    points: list[Any] | None = None,
+    center_point: tuple[float, float] | None = None,
+    dist_m: int = 15000,
+    width_cm: float = 10.0,
+    height_cm: float = 8.0,
+    x_cm: float | HorizontalAlign | None = "center",
+    y_cm: float | VerticalAlign | None = "center",
+    margin_x_cm: float | None = None,
+    margin_y_cm: float | None = None,
+    margin_cm: float = 0.0,
+    bg_color: str = "#f6f8fa",
+    water_color: str = "#72b1b1",
+    major_water_color: str | None = None,
+    minor_width: float = 0.5,
+    major_width: float = 2.0,
+    major_len_m: float = 400.0,
+    border_color: str | None = None,
+    border_opacity: float = 1.0,
+    border_width: int = 0,
+    dpi: int | None = None,
+) -> Image.Image:
+    """Ajoute une carte type rivieres/eaux (style beautifulMaps/createWaterMap.py).
+
+    Passe soit ``points`` (liste de points GPX — le centre est calcule automatiquement),
+    soit ``center_point`` (tuple (lat, lon) explicite).
+    """
+    resolved_dpi = dpi if dpi is not None else int(img.info.get("dpi", DPI))
+    x0, y0, x1, y1 = _compute_box_rect(
+        img, width_cm, height_cm, x_cm, y_cm, margin_x_cm, margin_y_cm, margin_cm, resolved_dpi
+    )
+    box_w = x1 - x0
+    box_h = y1 - y0
+    if box_w <= 2 or box_h <= 2:
+        return img
+
+    if center_point is not None:
+        resolved_center = center_point
+    elif points:
+        geo = [
+            (_get_point_value(p, "lat", 0, 0.0), _get_point_value(p, "lon", 1, 0.0))
+            for p in points
+            if not (_get_point_value(p, "lat", 0, 0.0) == 0.0 and _get_point_value(p, "lon", 1, 0.0) == 0.0)
+        ]
+        if not geo:
+            return img
+        resolved_center = (
+            (min(lat for lat, _ in geo) + max(lat for lat, _ in geo)) / 2.0,
+            (min(lon for _, lon in geo) + max(lon for _, lon in geo)) / 2.0,
+        )
+    else:
+        raise ValueError("add_map_v2: passe 'points' (GPX) ou 'center_point' (lat, lon).")
+
+    try:
+        nx = importlib.import_module("networkx")
+        ox = importlib.import_module("osmnx")
+    except ImportError as exc:
+        raise ImportError("osmnx et networkx sont requis pour add_map_v2") from exc
+
+    g1 = ox.graph_from_point(
+        resolved_center,
+        dist=max(100, int(dist_m)),
+        dist_type="bbox",
+        network_type="all",
+        custom_filter='["natural"~"water"]',
+    )
+    g2 = ox.graph_from_point(
+        resolved_center,
+        dist=max(100, int(dist_m)),
+        dist_type="bbox",
+        network_type="all",
+        custom_filter='["waterway"~"river"]',
+    )
+    graph = nx.compose(g1, g2)
+
+    strong_color = major_water_color if major_water_color is not None else water_color
+    edge_colors: list[str] = []
+    edge_widths: list[float] = []
+    for _, _, _, attrs in graph.edges(keys=True, data=True):
+        length = float(attrs.get("length", 0.0))
+        if length > major_len_m:
+            edge_colors.append(strong_color)
+            edge_widths.append(major_width)
+        else:
+            edge_colors.append(water_color)
+            edge_widths.append(minor_width)
+
+    map_layer = _render_osmnx_graph_image(
+        graph=graph,
+        width_px=box_w,
+        height_px=box_h,
+        dpi=resolved_dpi,
+        bgcolor=bg_color,
+        edge_colors=edge_colors,
+        edge_widths=edge_widths,
+        edge_alpha=1.0,
+    )
+
+    border_rgba = _resolve_rgba(border_color, border_opacity)
+    if border_rgba is not None and border_width > 0:
+        draw = ImageDraw.Draw(map_layer)
         draw.rectangle((0, 0, box_w - 1, box_h - 1), outline=border_rgba, width=border_width)
 
     img.alpha_composite(map_layer, (x0, y0))
