@@ -1395,11 +1395,16 @@ def _render_osmnx_graph_image(
     edge_colors: list[str],
     edge_widths: list[float],
     edge_alpha: float = 1.0,
+    trace_points: list[tuple[float, float]] | None = None,
+    trace_color: str | None = None,
+    trace_opacity: float = 1.0,
+    trace_width: float = 3.0,
 ) -> tuple[Image.Image, float, float, float, float]:
     """Rend un graph OSMnx en image PIL RGBA sans fenetre interactive.
 
-    Retourne (image, west, east, south, north) — les limites reelles des axes matplotlib,
-    a utiliser pour projeter des coordonnees lat/lon sur l'image.
+    Retourne (image, west, east, south, north) — les limites reelles des axes matplotlib.
+    Si `trace_points` est fourni, le trace est dessine dans le meme axe matplotlib
+    que la carte pour eviter tout decalage de projection.
     """
     try:
         ox = importlib.import_module("osmnx")
@@ -1427,17 +1432,37 @@ def _render_osmnx_graph_image(
         edge_alpha=edge_alpha,
     )
 
-    # Capturer les limites reelles AVANT tight_layout (ne les change pas)
+    # Capturer les limites reelles AVANT ajout de la trace.
     render_west, render_east = ax.get_xlim()   # lon
     render_south, render_north = ax.get_ylim() # lat
 
-    fig.tight_layout(pad=0)
+    if trace_points and trace_color:
+        trace_lon = [lon for lat, lon in trace_points]
+        trace_lat = [lat for lat, lon in trace_points]
+        if len(trace_lon) >= 2:
+            ax.plot(
+                trace_lon,
+                trace_lat,
+                color=trace_color,
+                alpha=_clamp01(trace_opacity),
+                linewidth=max(0.1, float(trace_width)),
+                solid_capstyle="round",
+                solid_joinstyle="round",
+                zorder=5,
+            )
+            # Evite tout autoscale apres ajout de la trace.
+            ax.set_xlim(render_west, render_east)
+            ax.set_ylim(render_south, render_north)
+
+    # Evite les recadrages de sauvegarde qui peuvent creer 1-2 px d'offset.
+    ax.set_position([0.0, 0.0, 1.0, 1.0])
     buffer = BytesIO()
     fig.savefig(
         buffer,
         format="png",
         dpi=dpi,
-        bbox_inches="tight",
+        bbox_inches=None,
+        pad_inches=0,
         facecolor=fig.get_facecolor(),
         transparent=False,
     )
@@ -1570,8 +1595,14 @@ def add_map_v1(
             edge_colors.append(color_xxlong)
             edge_widths.append(width_xxlong)
 
-    # _render_osmnx_graph_image retourne aussi les limites reelles des axes matplotlib
-    map_layer, render_west, render_east, render_south, render_north = _render_osmnx_graph_image(
+    # Trace GPX eventuel: dessine directement dans l'axe matplotlib d'OSMnx.
+    geo_to_draw: list[tuple[float, float]] = [
+        (_get_point_value(p, "lat", 0, 0.0), _get_point_value(p, "lon", 1, 0.0))
+        for p in (trace_points if trace_points is not None else (points or []))
+        if not (_get_point_value(p, "lat", 0, 0.0) == 0.0 and _get_point_value(p, "lon", 1, 0.0) == 0.0)
+    ]
+
+    map_layer, _, _, _, _ = _render_osmnx_graph_image(
         graph=graph,
         width_px=box_w,
         height_px=box_h,
@@ -1580,28 +1611,11 @@ def add_map_v1(
         edge_colors=edge_colors,
         edge_widths=edge_widths,
         edge_alpha=1.0,
+        trace_points=geo_to_draw,
+        trace_color=trace_color,
+        trace_opacity=trace_opacity,
+        trace_width=max(1, int(trace_width)),
     )
-
-    # Trace GPX projetee avec les bornes reelles du rendu matplotlib (projection lineaire)
-    trace_rgba = _resolve_rgba(trace_color, trace_opacity)
-    if trace_rgba is not None:
-        geo_to_draw: list[tuple[float, float]] = [
-            (_get_point_value(p, "lat", 0, 0.0), _get_point_value(p, "lon", 1, 0.0))
-            for p in (trace_points if trace_points is not None else (points or []))
-            if not (_get_point_value(p, "lat", 0, 0.0) == 0.0 and _get_point_value(p, "lon", 1, 0.0) == 0.0)
-        ]
-        if len(geo_to_draw) >= 2:
-            lon_span = max(render_east - render_west, 1e-10)
-            lat_span = max(render_north - render_south, 1e-10)
-            trace_px: list[tuple[int, int]] = [
-                (
-                    int(round((lon - render_west) / lon_span * (box_w - 1))),
-                    int(round((render_north - lat) / lat_span * (box_h - 1))),
-                )
-                for lat, lon in geo_to_draw
-            ]
-            draw_layer = ImageDraw.Draw(map_layer)
-            draw_layer.line(trace_px, fill=trace_rgba, width=max(1, int(trace_width)), joint="curve")
 
     border_rgba = _resolve_rgba(border_color, border_opacity)
     if border_rgba is not None and border_width > 0:
