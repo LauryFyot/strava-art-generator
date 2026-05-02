@@ -1391,7 +1391,7 @@ def _render_osmnx_graph_image(
     width_px: int,
     height_px: int,
     dpi: int,
-    bgcolor: str,
+    bgcolor: str | None,
     edge_colors: list[str],
     edge_widths: list[float],
     edge_alpha: float = 1.0,
@@ -1418,19 +1418,36 @@ def _render_osmnx_graph_image(
 
     fig_w = max(1.0, float(width_px) / max(dpi, 1))
     fig_h = max(1.0, float(height_px) / max(dpi, 1))
+    transparent_bg = bgcolor is None or str(bgcolor).strip().lower() == "transparent"
+    plot_bgcolor = "#ffffff" if transparent_bg else str(bgcolor)
+
+    bbox: tuple[float, float, float, float] | None = None
+    try:
+        graph_edges = ox.convert.graph_to_gdfs(graph, nodes=False)
+        left, bottom, right, top = graph_edges.total_bounds
+        bbox = (left, bottom, right, top)
+    except Exception:
+        bbox = None
 
     fig, ax = ox.plot_graph(
         graph,
         node_size=0,
         figsize=(fig_w, fig_h),
         dpi=dpi,
-        bgcolor=bgcolor,
+        bgcolor=plot_bgcolor,
         show=False,
         save=False,
+        bbox=bbox,
         edge_color=edge_colors,
         edge_linewidth=edge_widths,
         edge_alpha=edge_alpha,
     )
+    # Force l'axe a remplir toute la figure sans ratio lat/lon
+    ax.set_aspect("auto")
+
+    if transparent_bg:
+        fig.patch.set_alpha(0.0)
+        ax.patch.set_alpha(0.0)
 
     # Capturer les limites reelles AVANT ajout de la trace.
     render_west, render_east = ax.get_xlim()   # lon
@@ -1455,6 +1472,7 @@ def _render_osmnx_graph_image(
             ax.set_ylim(render_south, render_north)
 
     # Evite les recadrages de sauvegarde qui peuvent creer 1-2 px d'offset.
+    ax.margins(0)
     ax.set_position([0.0, 0.0, 1.0, 1.0])
     buffer = BytesIO()
     fig.savefig(
@@ -1464,7 +1482,7 @@ def _render_osmnx_graph_image(
         bbox_inches=None,
         pad_inches=0,
         facecolor=fig.get_facecolor(),
-        transparent=False,
+        transparent=transparent_bg,
     )
     plt.close(fig)
 
@@ -1485,12 +1503,16 @@ def add_map_v1(
     network_type: str = "all",
     width_cm: float = 10.0,
     height_cm: float = 8.0,
+    map_width_cm: float | None = None,
+    map_height_cm: float | None = None,
     x_cm: float | HorizontalAlign | None = "center",
     y_cm: float | VerticalAlign | None = "center",
+    top_left_x_cm: float | None = None,
+    top_left_y_cm: float | None = None,
     margin_x_cm: float | None = None,
     margin_y_cm: float | None = None,
     margin_cm: float = 0.0,
-    bg_color: str = "#061529",
+    bg_color: str | None = "#ffffff",
     color_short: str = "#a6a6a6",
     color_medium: str = "#676767",
     color_long: str = "#454545",
@@ -1518,10 +1540,29 @@ def add_map_v1(
 
     Passe soit ``points`` (liste de points GPX — le centre est calcule automatiquement),
     soit ``center_point`` (tuple (lat, lon) explicite).
+
+    ``bg_color`` peut etre une couleur CSS/hex, ``None`` ou ``"transparent"``.
+
+    ``top_left_x_cm``/``top_left_y_cm`` permettent un positionnement absolu
+    en centimetres depuis le coin haut-gauche (prioritaires sur ``x_cm``/``y_cm``).
+    ``map_width_cm``/``map_height_cm`` sont des alias explicites des dimensions.
     """
     resolved_dpi = dpi if dpi is not None else int(img.info.get("dpi", DPI))
+    resolved_width_cm = float(width_cm if map_width_cm is None else map_width_cm)
+    resolved_height_cm = float(height_cm if map_height_cm is None else map_height_cm)
+    resolved_x_cm: float | HorizontalAlign | None = x_cm if top_left_x_cm is None else float(top_left_x_cm)
+    resolved_y_cm: float | VerticalAlign | None = y_cm if top_left_y_cm is None else float(top_left_y_cm)
+
     x0, y0, x1, y1 = _compute_box_rect(
-        img, width_cm, height_cm, x_cm, y_cm, margin_x_cm, margin_y_cm, margin_cm, resolved_dpi
+        img,
+        resolved_width_cm,
+        resolved_height_cm,
+        resolved_x_cm,
+        resolved_y_cm,
+        margin_x_cm,
+        margin_y_cm,
+        margin_cm,
+        resolved_dpi,
     )
     box_w = x1 - x0
     box_h = y1 - y0
@@ -1633,8 +1674,12 @@ def add_map_v2(
     dist_m: int = 15000,
     width_cm: float = 10.0,
     height_cm: float = 8.0,
+    map_width_cm: float | None = None,
+    map_height_cm: float | None = None,
     x_cm: float | HorizontalAlign | None = "center",
     y_cm: float | VerticalAlign | None = "center",
+    top_left_x_cm: float | None = None,
+    top_left_y_cm: float | None = None,
     margin_x_cm: float | None = None,
     margin_y_cm: float | None = None,
     margin_cm: float = 0.0,
@@ -1653,10 +1698,27 @@ def add_map_v2(
 
     Passe soit ``points`` (liste de points GPX — le centre est calcule automatiquement),
     soit ``center_point`` (tuple (lat, lon) explicite).
+
+    ``top_left_x_cm``/``top_left_y_cm`` permettent un positionnement absolu
+    en centimetres depuis le coin haut-gauche (prioritaires sur ``x_cm``/``y_cm``).
+    ``map_width_cm``/``map_height_cm`` sont des alias explicites des dimensions.
     """
     resolved_dpi = dpi if dpi is not None else int(img.info.get("dpi", DPI))
+    resolved_width_cm = float(width_cm if map_width_cm is None else map_width_cm)
+    resolved_height_cm = float(height_cm if map_height_cm is None else map_height_cm)
+    resolved_x_cm: float | HorizontalAlign | None = x_cm if top_left_x_cm is None else float(top_left_x_cm)
+    resolved_y_cm: float | VerticalAlign | None = y_cm if top_left_y_cm is None else float(top_left_y_cm)
+
     x0, y0, x1, y1 = _compute_box_rect(
-        img, width_cm, height_cm, x_cm, y_cm, margin_x_cm, margin_y_cm, margin_cm, resolved_dpi
+        img,
+        resolved_width_cm,
+        resolved_height_cm,
+        resolved_x_cm,
+        resolved_y_cm,
+        margin_x_cm,
+        margin_y_cm,
+        margin_cm,
+        resolved_dpi,
     )
     box_w = x1 - x0
     box_h = y1 - y0
