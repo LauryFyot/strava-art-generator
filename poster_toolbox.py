@@ -1419,8 +1419,10 @@ def _render_osmnx_graph_image(
     except ImportError as exc:
         raise ImportError("matplotlib est requis pour add_map_v1/add_map_v2") from exc
 
-    fig_w = max(1.0, float(width_px) / max(dpi, 1))
-    fig_h = max(1.0, float(height_px) / max(dpi, 1))
+    # Keep the exact output ratio, even for very small map boxes.
+    # A 1-inch minimum introduces visible stretching on narrow renders.
+    fig_w = max(0.05, float(width_px) / max(dpi, 1))
+    fig_h = max(0.05, float(height_px) / max(dpi, 1))
     transparent_bg = bgcolor is None or str(bgcolor).strip().lower() == "transparent"
     plot_bgcolor = "#ffffff" if transparent_bg else str(bgcolor)
 
