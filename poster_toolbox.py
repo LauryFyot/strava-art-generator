@@ -1395,6 +1395,9 @@ def _render_osmnx_graph_image(
     edge_colors: list[str],
     edge_widths: list[float],
     edge_alpha: float = 1.0,
+    forced_bbox: tuple[float, float, float, float] | None = None,
+    bbox_points: list[tuple[float, float]] | None = None,
+    bbox_padding: float = 0.15,
     trace_points: list[tuple[float, float]] | None = None,
     trace_color: str | None = None,
     trace_opacity: float = 1.0,
@@ -1421,11 +1424,77 @@ def _render_osmnx_graph_image(
     transparent_bg = bgcolor is None or str(bgcolor).strip().lower() == "transparent"
     plot_bgcolor = "#ffffff" if transparent_bg else str(bgcolor)
 
-    bbox: tuple[float, float, float, float] | None = None
+    bbox: tuple[float, float, float, float] | None = forced_bbox
     try:
         graph_edges = ox.convert.graph_to_gdfs(graph, nodes=False)
-        left, bottom, right, top = graph_edges.total_bounds
-        bbox = (left, bottom, right, top)
+        edge_left, edge_bottom, edge_right, edge_top = graph_edges.total_bounds
+
+        if bbox is None:
+            left, bottom, right, top = edge_left, edge_bottom, edge_right, edge_top
+            if bbox_points and len(bbox_points) >= 2:
+                trace_lons = [lon for lat, lon in bbox_points]
+                trace_lats = [lat for lat, lon in bbox_points]
+                trace_left = min(trace_lons)
+                trace_right = max(trace_lons)
+                trace_bottom = min(trace_lats)
+                trace_top = max(trace_lats)
+
+                pad = max(0.0, float(bbox_padding))
+                trace_lon_span = max(1e-9, trace_right - trace_left)
+                trace_lat_span = max(1e-9, trace_top - trace_bottom)
+                trace_lon_span *= (1.0 + pad * 2.0)
+                trace_lat_span *= (1.0 + pad * 2.0)
+
+                edge_lon_span = max(1e-9, edge_right - edge_left)
+                edge_lat_span = max(1e-9, edge_top - edge_bottom)
+
+                # Cadrage hybride: recentre sur la trace, mais garde un minimum
+                # d'emprise route pour afficher le contexte autour.
+                lon_span = max(trace_lon_span, edge_lon_span)
+                lat_span = max(trace_lat_span, edge_lat_span)
+                cx = (trace_left + trace_right) / 2.0
+                cy = (trace_bottom + trace_top) / 2.0
+
+                left = cx - lon_span / 2.0
+                right = cx + lon_span / 2.0
+                bottom = cy - lat_span / 2.0
+                top = cy + lat_span / 2.0
+
+                # Evite les cas degeneres de traces quasi-verticales/horizontales.
+                if (right - left) < 1e-9:
+                    left -= edge_lon_span * 0.01
+                    right += edge_lon_span * 0.01
+                if (top - bottom) < 1e-9:
+                    bottom -= edge_lat_span * 0.01
+                    top += edge_lat_span * 0.01
+
+            bbox = (left, bottom, right, top)
+
+            # Adapte la bbox au ratio de sortie pour eviter l'etirement :
+            # on ajoute du contexte autour au lieu de deformer la carte.
+            lon_span = max(1e-9, right - left)
+            lat_span = max(1e-9, top - bottom)
+            fig_ratio = max(1e-9, float(width_px) / max(1.0, float(height_px)))
+            lat0 = (bottom + top) / 2.0
+            cos_lat = max(1e-6, abs(math.cos(math.radians(lat0))))
+            target_lat_over_lon = cos_lat / fig_ratio
+            current_lat_over_lon = lat_span / lon_span
+
+            cx = (left + right) / 2.0
+            cy = (bottom + top) / 2.0
+            if current_lat_over_lon < target_lat_over_lon:
+                # Trop large pour le format: on etend en latitude.
+                lat_span = lon_span * target_lat_over_lon
+            else:
+                # Trop haut pour le format: on etend en longitude.
+                lon_span = lat_span / max(target_lat_over_lon, 1e-9)
+
+            bbox = (
+                cx - lon_span / 2.0,
+                cy - lat_span / 2.0,
+                cx + lon_span / 2.0,
+                cy + lat_span / 2.0,
+            )
     except Exception:
         bbox = None
 
@@ -1442,9 +1511,6 @@ def _render_osmnx_graph_image(
         edge_linewidth=edge_widths,
         edge_alpha=edge_alpha,
     )
-    # Force l'axe a remplir toute la figure sans ratio lat/lon
-    ax.set_aspect("auto")
-
     if transparent_bg:
         fig.patch.set_alpha(0.0)
         ax.patch.set_alpha(0.0)
@@ -1489,6 +1555,14 @@ def _render_osmnx_graph_image(
     buffer.seek(0)
     with Image.open(buffer) as rendered:
         image = rendered.convert("RGBA")
+
+    if not transparent_bg:
+        # Matplotlib/OSMnx peut laisser des pixels alpha autour de l'axe
+        # selon le ratio; on force un fond opaque sur toute la tuile.
+        opaque_bg = Image.new("RGBA", image.size, plot_bgcolor)
+        opaque_bg.alpha_composite(image)
+        image = opaque_bg
+
     if image.size != (width_px, height_px):
         image = image.resize((width_px, height_px), Image.Resampling.LANCZOS)
     return image, render_west, render_east, render_south, render_north
@@ -1603,18 +1677,66 @@ def add_map_v1(
     else:
         resolved_dist_m = max(100, int(dist_m))
 
+    # Si le cadre est tres rectangulaire, augmente le rayon OSM pour eviter
+    # des zones vides quand on preserve la geometrie (pas d'etirement).
+    frame_ratio = float(box_w) / max(1.0, float(box_h))
+    dist_aspect_scale = max(frame_ratio, 1.0 / max(frame_ratio, 1e-9))
+    resolved_dist_m = max(100, int(resolved_dist_m * dist_aspect_scale))
+
     try:
         ox = importlib.import_module("osmnx")
     except ImportError as exc:
         raise ImportError("osmnx est requis pour add_map_v1") from exc
 
-    graph = ox.graph_from_point(
-        resolved_center,
-        dist=resolved_dist_m,
-        retain_all=True,
-        simplify=True,
-        network_type=network_type,
-    )
+    # Prefer a rectangular fetch area based on the GPX trace so roads can
+    # populate the full render frame (especially for non-square map boxes).
+    render_bbox: tuple[float, float, float, float] | None = None
+    if geo:
+        min_lat = min(lat for lat, _ in geo)
+        max_lat = max(lat for lat, _ in geo)
+        min_lon = min(lon for _, lon in geo)
+        max_lon = max(lon for _, lon in geo)
+
+        lat_span = max(1e-9, max_lat - min_lat)
+        lon_span = max(1e-9, max_lon - min_lon)
+        pad = max(0.0, float(map_padding))
+        lat_span *= (1.0 + pad * 2.0)
+        lon_span *= (1.0 + pad * 2.0)
+
+        # Match the bbox ratio to the output frame ratio without stretching
+        # the map: we expand whichever axis is too small.
+        frame_ratio = float(box_w) / max(1.0, float(box_h))
+        cos_lat = max(1e-6, abs(math.cos(math.radians(resolved_center[0]))))
+        target_lat_over_lon = cos_lat / max(frame_ratio, 1e-9)
+        current_lat_over_lon = lat_span / lon_span
+
+        if current_lat_over_lon < target_lat_over_lon:
+            lat_span = lon_span * target_lat_over_lon
+        else:
+            lon_span = lat_span / max(target_lat_over_lon, 1e-9)
+
+        c_lat = (min_lat + max_lat) / 2.0
+        c_lon = (min_lon + max_lon) / 2.0
+        north = c_lat + lat_span / 2.0
+        south = c_lat - lat_span / 2.0
+        east = c_lon + lon_span / 2.0
+        west = c_lon - lon_span / 2.0
+
+        render_bbox = (west, south, east, north)
+        graph = ox.graph_from_bbox(
+            bbox=render_bbox,
+            retain_all=True,
+            simplify=True,
+            network_type=network_type,
+        )
+    else:
+        graph = ox.graph_from_point(
+            resolved_center,
+            dist=resolved_dist_m,
+            retain_all=True,
+            simplify=True,
+            network_type=network_type,
+        )
 
     edge_colors: list[str] = []
     edge_widths: list[float] = []
@@ -1652,6 +1774,9 @@ def add_map_v1(
         edge_colors=edge_colors,
         edge_widths=edge_widths,
         edge_alpha=1.0,
+        forced_bbox=render_bbox,
+        bbox_points=geo_to_draw,
+        bbox_padding=map_padding,
         trace_points=geo_to_draw,
         trace_color=trace_color,
         trace_opacity=trace_opacity,
