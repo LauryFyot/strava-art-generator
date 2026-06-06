@@ -167,6 +167,92 @@ def _moving_average(values: list[float], window: int) -> list[float]:
         smoothed.append(sum(chunk) / len(chunk))
     return smoothed
 
+def _measure_text_bbox(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    letter_spacing: int = 0,
+) -> tuple[int, int, int, int]:
+    if not text:
+        return (0, 0, 0, 0)
+
+    if letter_spacing == 0:
+        return draw.textbbox((0, 0), text, font=font)
+
+    # Measure as if glyphs are drawn sequentially using their typographic advance.
+    cursor_x = 0.0
+    min_x: float | None = None
+    min_y: int | None = None
+    max_x: float | None = None
+    max_y: int | None = None
+
+    for idx, ch in enumerate(text):
+        ch_bbox = draw.textbbox((0, 0), ch, font=font)
+        left = cursor_x + ch_bbox[0]
+        right = cursor_x + ch_bbox[2]
+        top = ch_bbox[1]
+        bottom = ch_bbox[3]
+
+        min_x = left if min_x is None else min(min_x, left)
+        min_y = top if min_y is None else min(min_y, top)
+        max_x = right if max_x is None else max(max_x, right)
+        max_y = bottom if max_y is None else max(max_y, bottom)
+
+        advance = float(draw.textlength(ch, font=font))
+        cursor_x += advance
+        if idx < len(text) - 1:
+            cursor_x += letter_spacing
+
+    assert min_x is not None and min_y is not None and max_x is not None and max_y is not None
+    return (int(math.floor(min_x)), min_y, int(math.ceil(max_x)), max_y)
+
+
+def _measure_multiline_bbox(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    spacing: int,
+    align: str,
+    letter_spacing: int = 0,
+) -> tuple[int, int, int, int]:
+    if not text:
+        return (0, 0, 0, 0)
+
+    if letter_spacing == 0:
+        return draw.multiline_textbbox((0, 0), text, font=font, spacing=spacing, align=align)
+
+    lines = text.split("\n")
+    if not lines:
+        return (0, 0, 0, 0)
+
+    line_bboxes = [_measure_text_bbox(draw, line, font, letter_spacing) for line in lines]
+    line_heights = [bbox[3] - bbox[1] for bbox in line_bboxes]
+    line_widths = [bbox[2] - bbox[0] for bbox in line_bboxes]
+    total_h = sum(line_heights) + spacing * max(0, len(lines) - 1)
+    total_w = max(line_widths) if line_widths else 0
+    return (0, 0, total_w, total_h)
+
+
+def _draw_text_with_letter_spacing(
+    draw: ImageDraw.ImageDraw,
+    position: tuple[int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill: tuple[int, int, int, int] | str,
+    letter_spacing: int = 0,
+) -> None:
+    if letter_spacing == 0 or len(text) <= 1:
+        draw.text(position, text, font=font, fill=fill)
+        return
+
+    x, y = position
+    cursor_x = float(x)
+    for idx, ch in enumerate(text):
+        draw.text((int(round(cursor_x)), y), ch, font=font, fill=fill)
+        cursor_x += float(draw.textlength(ch, font=font))
+        if idx < len(text) - 1:
+            cursor_x += letter_spacing
+
 def _compute_box_rect(
     img: Image.Image,
     width_cm: float,
@@ -213,6 +299,7 @@ def _wrap_text(
     text: str,
     font: ImageFont.ImageFont,
     max_width: int,
+    letter_spacing: int = 0,
 ) -> str:
     words = text.replace("\n", " \n ").split()
     lines: list[str] = []
@@ -225,7 +312,7 @@ def _wrap_text(
             continue
 
         candidate = word if not current else f"{current} {word}"
-        w = draw.textbbox((0, 0), candidate, font=font)
+        w = _measure_text_bbox(draw, candidate, font, letter_spacing)
         if (w[2] - w[0]) <= max_width:
             current = candidate
             continue
@@ -237,7 +324,7 @@ def _wrap_text(
         chunk = ""
         for ch in word:
             trial = chunk + ch
-            tw = draw.textbbox((0, 0), trial, font=font)[2] - draw.textbbox((0, 0), trial, font=font)[0]
+            tw = _measure_text_bbox(draw, trial, font, letter_spacing)[2] - _measure_text_bbox(draw, trial, font, letter_spacing)[0]
             if tw <= max_width:
                 chunk = trial
             else:
@@ -261,9 +348,10 @@ def _fit_text(
     max_size: int,
     align: str,
     wrap_text: bool = True,
+    letter_spacing: int = 0,
 ) -> tuple[ImageFont.ImageFont, str, int]:
     best_font = _load_font(font_path, min_size)
-    best_text = _wrap_text(draw, text, best_font, max_w) if wrap_text else " ".join(text.splitlines())
+    best_text = _wrap_text(draw, text, best_font, max_w, letter_spacing=letter_spacing) if wrap_text else " ".join(text.splitlines())
     best_spacing = max(2, int(min_size * 0.25))
 
     lo, hi = min_size, max_size
@@ -272,12 +360,9 @@ def _fit_text(
     while lo <= hi:
         mid = (lo + hi) // 2
         font = _load_font(font_path, mid)
-        wrapped = _wrap_text(draw, text, font, max_w) if wrap_text else " ".join(text.splitlines())
+        wrapped = _wrap_text(draw, text, font, max_w, letter_spacing=letter_spacing) if wrap_text else " ".join(text.splitlines())
         spacing = max(2, int(mid * 0.25))
-        if wrap_text:
-            bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing, align=align)
-        else:
-            bbox = draw.textbbox((0, 0), wrapped, font=font)
+        bbox = _measure_multiline_bbox(draw, wrapped, font, spacing, align, letter_spacing=letter_spacing) if wrap_text else _measure_text_bbox(draw, wrapped, font, letter_spacing)
         if (bbox[2] - bbox[0]) <= max_w and (bbox[3] - bbox[1]) <= max_h and wrapped.strip():
             found = True
             best_font, best_text, best_spacing = font, wrapped, spacing
@@ -293,11 +378,8 @@ def _fit_text(
     spacing = max(2, int(min_size * 0.25))
     candidate = text.strip().replace("\n", " ") if not wrap_text else text.strip()
     while candidate:
-        wrapped = _wrap_text(draw, candidate, font, max_w) if wrap_text else candidate
-        if wrap_text:
-            bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing, align=align)
-        else:
-            bbox = draw.textbbox((0, 0), wrapped, font=font)
+        wrapped = _wrap_text(draw, candidate, font, max_w, letter_spacing=letter_spacing) if wrap_text else candidate
+        bbox = _measure_multiline_bbox(draw, wrapped, font, spacing, align, letter_spacing=letter_spacing) if wrap_text else _measure_text_bbox(draw, wrapped, font, letter_spacing)
         if (bbox[2] - bbox[0]) <= max_w and (bbox[3] - bbox[1]) <= max_h:
             return font, wrapped, spacing
         candidate = candidate[:-1].rstrip()
@@ -314,14 +396,12 @@ def _truncate_text_to_box(
     max_h: int,
     spacing: int,
     wrap_text: bool = True,
+    letter_spacing: int = 0,
 ) -> str:
     candidate = text.strip().replace("\n", " ") if not wrap_text else text.strip()
     while candidate:
-        wrapped = _wrap_text(draw, candidate, font, max_w) if wrap_text else candidate
-        if wrap_text:
-            bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing, align="left")
-        else:
-            bbox = draw.textbbox((0, 0), wrapped, font=font)
+        wrapped = _wrap_text(draw, candidate, font, max_w, letter_spacing=letter_spacing) if wrap_text else candidate
+        bbox = _measure_multiline_bbox(draw, wrapped, font, spacing, "left", letter_spacing=letter_spacing) if wrap_text else _measure_text_bbox(draw, wrapped, font, letter_spacing)
         if (bbox[2] - bbox[0]) <= max_w and (bbox[3] - bbox[1]) <= max_h:
             return wrapped
         candidate = candidate[:-1].rstrip()
@@ -338,11 +418,14 @@ def _draw_multiline_justified(
     font: ImageFont.ImageFont,
     fill: tuple[int, int, int, int] | str,
     spacing: int,
+    justify_last_line: bool = False,
+    letter_spacing: int = 0,
 ) -> None:
     if not lines:
         return
 
-    line_height = draw.textbbox((0, 0), "Ag", font=font)[3] - draw.textbbox((0, 0), "Ag", font=font)[1]
+    line_bbox = _measure_text_bbox(draw, "Ag", font, letter_spacing)
+    line_height = line_bbox[3] - line_bbox[1]
     cy = y
     last_index = len(lines) - 1
 
@@ -352,29 +435,34 @@ def _draw_multiline_justified(
             cy += line_height + spacing
             continue
 
-        # Last line is left-aligned to keep natural paragraph endings.
-        if idx == last_index:
-            draw.text((x, cy), line, font=font, fill=fill)
+        # Last line is left-aligned by default to keep natural paragraph endings.
+        if idx == last_index and not justify_last_line:
+            _draw_text_with_letter_spacing(draw, (x, cy), line, font, fill, letter_spacing)
             cy += line_height + spacing
             continue
 
         words = line.split()
         if len(words) <= 1:
-            draw.text((x, cy), line, font=font, fill=fill)
+            _draw_text_with_letter_spacing(draw, (x, cy), line, font, fill, letter_spacing)
             cy += line_height + spacing
             continue
 
-        word_widths = [draw.textbbox((0, 0), w, font=font)[2] - draw.textbbox((0, 0), w, font=font)[0] for w in words]
+        word_widths = [_measure_text_bbox(draw, w, font, letter_spacing)[2] - _measure_text_bbox(draw, w, font, letter_spacing)[0] for w in words]
         total_words = sum(word_widths)
         gaps = len(words) - 1
-        base_space = draw.textbbox((0, 0), " ", font=font)[2] - draw.textbbox((0, 0), " ", font=font)[0]
+        # Keep justification consistent with tracking applied on full strings:
+        # a space between two words corresponds to one space glyph plus tracking
+        # on both sides of that space.
+        base_space = _measure_text_bbox(draw, " ", font, 0)[2] - _measure_text_bbox(draw, " ", font, 0)[0]
+        if letter_spacing > 0:
+            base_space += 2 * letter_spacing
         extra_total = max(0, max_w - total_words - base_space * gaps)
         extra_per_gap = extra_total // gaps
         remainder = extra_total % gaps
 
         cx = x
         for i, w in enumerate(words):
-            draw.text((cx, cy), w, font=font, fill=fill)
+            _draw_text_with_letter_spacing(draw, (cx, cy), w, font, fill, letter_spacing)
             cx += word_widths[i]
             if i < gaps:
                 cx += base_space + extra_per_gap + (1 if i < remainder else 0)
@@ -448,7 +536,7 @@ def add_textbox(
     text_valign: TextVerticalAlign = "center",
     align: HorizontalAlign | None = None,
     padding_cm: float = 0.25,
-    bg_color: str = "#ffffff",
+    bg_color: str = "transparent",
     bg_opacity: float = 1.0,
     border_color: str | None = "#b8b5ab",
     border_opacity: float = 1.0,
@@ -456,6 +544,8 @@ def add_textbox(
     text_color: str = "#312f2a",
     text_opacity: float = 1.0,
     wrap_text: bool = True,
+    justify_last_line: bool = False,
+    letter_spacing: int = 0,
     text_rotation: int = 0,
     dpi: int | None = None,
 ) -> Image.Image:
@@ -498,6 +588,8 @@ def add_textbox(
         text_color:     Couleur du texte.
         text_opacity:   Opacite du texte entre 0.0 et 1.0.
         wrap_text:      True = autorise retour a la ligne, False = force mono-ligne.
+        justify_last_line: True = applique aussi la justification sur la derniere ligne.
+        letter_spacing: Espacement supplementaire en pixels entre les lettres.
         text_rotation:  Rotation du texte en degres (0, 90, 180, 270).
         dpi:            DPI a utiliser pour la conversion cm->px (auto si None).
 
@@ -582,7 +674,16 @@ def add_textbox(
         forced_size = max(1, int(font_size))
         font = _load_font(font_path, forced_size)
         spacing = max(2, int(forced_size * 0.25))
-        wrapped = _truncate_text_to_box(draw, text, font, fit_w, fit_h, spacing, wrap_text=wrap_text)
+        wrapped = _truncate_text_to_box(
+            draw,
+            text,
+            font,
+            fit_w,
+            fit_h,
+            spacing,
+            wrap_text=wrap_text,
+            letter_spacing=letter_spacing,
+        )
     else:
         effective_max_font_size = (
             max(min_font_size, int(max(fit_w, fit_h)))
@@ -599,15 +700,16 @@ def add_textbox(
             effective_max_font_size,
             layout_align,
             wrap_text=wrap_text,
+            letter_spacing=letter_spacing,
         )
 
     if not wrapped.strip():
         return img
 
     if wrap_text:
-        bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing, align=layout_align)
+        bbox = _measure_multiline_bbox(draw, wrapped, font, spacing, layout_align, letter_spacing=letter_spacing)
     else:
-        bbox = draw.textbbox((0, 0), wrapped, font=font)
+        bbox = _measure_text_bbox(draw, wrapped, font, letter_spacing)
     bx0, by0, bx1, by1 = bbox
     tw, th = bx1 - bx0, by1 - by0
 
@@ -629,20 +731,23 @@ def add_textbox(
         return img
 
     # Render text into a sprite first, then rotate and place into the textbox.
-    if text_align == "justify" and wrap_text:
+    if text_align == "justify":
         sprite_w = max(1, fit_w)
         sprite_h = max(1, th)
         sprite = Image.new("RGBA", (sprite_w, sprite_h), (0, 0, 0, 0))
         sprite_draw = ImageDraw.Draw(sprite)
+        lines = wrapped.split("\n") if wrap_text else [wrapped]
         _draw_multiline_justified(
             draw=sprite_draw,
-            lines=wrapped.split("\n"),
+            lines=lines,
             x=0,
             y=-by0,
             max_w=sprite_w,
             font=font,
             fill=text_rgba,
             spacing=spacing,
+            justify_last_line=justify_last_line,
+            letter_spacing=letter_spacing,
         )
     else:
         sprite_w = max(1, tw)
@@ -650,24 +755,25 @@ def add_textbox(
         sprite = Image.new("RGBA", (sprite_w, sprite_h), (0, 0, 0, 0))
         sprite_draw = ImageDraw.Draw(sprite)
         if wrap_text:
-            sprite_draw.multiline_text(
-                (-bx0, -by0),
-                wrapped,
-                font=font,
-                fill=text_rgba,
-                spacing=spacing,
-                align=layout_align,
-            )
+            yy = -by0
+            lines = wrapped.split("\n")
+            for line in lines:
+                _draw_text_with_letter_spacing(sprite_draw, (-bx0, yy), line, font, text_rgba, letter_spacing)
+                yy += _measure_text_bbox(sprite_draw, line, font, letter_spacing)[3] - _measure_text_bbox(sprite_draw, line, font, letter_spacing)[1] + spacing
         else:
-            sprite_draw.text((-bx0, -by0), wrapped, font=font, fill=text_rgba)
+            _draw_text_with_letter_spacing(sprite_draw, (-bx0, -by0), wrapped, font, text_rgba, letter_spacing)
 
     if rotation:
         sprite = sprite.rotate(rotation, expand=True, resample=Image.Resampling.BICUBIC)
 
     rw, rh = sprite.size
-    if layout_align == "center":
+    placement_align = layout_align
+    if text_align == "justify" and rotation in {90, 270}:
+        placement_align = "center"
+
+    if placement_align == "center":
         px = ix0 + (content_w - rw) // 2
-    elif layout_align == "right":
+    elif placement_align == "right":
         px = ix1 - rw
     else:
         px = ix0
