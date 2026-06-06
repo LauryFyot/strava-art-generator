@@ -16,6 +16,8 @@ Genere automatiquement une affiche de parcours (style carte + statistiques + pro
   - Points depart/arrivee
   - Titre vertical
   - Bloc de stats
+  - Galerie photo optionnelle
+  - Cartes d'information (meteo, activite, altitude max)
   - Profil d'altitude
 - Theme parametrique via JSON:
   - Couleurs
@@ -57,6 +59,24 @@ python poster_generator.py \
   --textbox-font-path /chemin/vers/ma-police.ttf
 ```
 
+### Variante poster editorial, proche de l'exemple fourni
+
+```bash
+python poster_generator.py \
+  --gpx gpx/Fiou.gpx \
+  --title "YORKSHIRE PEAKS" \
+  --subtitle "Yorkshire Dales" \
+  --location "Yorkshire Dales" \
+  --date "2026-06-06" \
+  --weather "Light showers" \
+  --activity "Trail running" \
+  --photo ./photo-1.jpg \
+  --photo ./photo-2.jpg \
+  --photo ./photo-3.jpg \
+  --output artifacts/yorkshire_editorial.png \
+  --theme theme.example.json
+```
+
 Si `--textbox-x-cm` et `--textbox-y-cm` ne sont pas fournis, la box est centree automatiquement.
 
 ### Options utiles
@@ -64,6 +84,10 @@ Si `--textbox-x-cm` et `--textbox-y-cm` ne sont pas fournis, la box est centree 
 - `--avg-speed-kmh 15.5`: utilise cette vitesse pour estimer la duree si le GPX n'a pas de timestamps
 - `--tile-zoom 10`: force le zoom carte (sinon auto)
 - `--no-tiles`: desactive le telechargement de tuiles et utilise un fond uni
+- `--photo /chemin/image.jpg`: ajoute une photo dans la galerie du bas, a repeter jusqu'a 3 fois
+- `--weather "Light showers"`: texte de la carte meteo
+- `--activity "Trail running"`: texte de la carte activite
+- `--location "Yorkshire Dales"`: petit label de lieu au-dessus du bloc stats
 
 ## Exemple de theme
 
@@ -76,6 +100,10 @@ Tu peux partir de `theme.example.json`, le copier puis modifier:
 - `map.style.vignette_strength`: assombrit legerement les bords
 - `map.style.grain_strength`: texture papier subtile
 - `map.route_glow_width`: halo autour de la trace
+- `layout.gallery_height`: hauteur de la galerie photo
+- `layout.facts_height`: hauteur de la rangee profile + cartes info
+- `gallery.*`: style de la galerie photo
+- `facts.*`: style des cartes d'information
 
 Tu peux aussi regler le style de la textbox dans le theme (`textbox`):
 

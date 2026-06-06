@@ -1570,6 +1570,91 @@ def _render_osmnx_graph_image(
     return image, render_west, render_east, render_south, render_north
 
 
+def _render_trace_only_image(
+    width_px: int,
+    height_px: int,
+    dpi: int,
+    bgcolor: str | None,
+    bbox: tuple[float, float, float, float],
+    trace_points: list[tuple[float, float]],
+    trace_color: str | None,
+    trace_opacity: float,
+    trace_width: float,
+) -> Image.Image:
+    """Rend uniquement la trace GPX dans un cadre geographique (sans routes/eaux)."""
+    try:
+        plt = importlib.import_module("matplotlib.pyplot")
+    except ImportError as exc:
+        raise ImportError("matplotlib est requis pour add_map_v2 (trace only)") from exc
+
+    fig_w = max(0.05, float(width_px) / max(dpi, 1))
+    fig_h = max(0.05, float(height_px) / max(dpi, 1))
+    transparent_bg = bgcolor is None or str(bgcolor).strip().lower() == "transparent"
+    plot_bgcolor = "#ffffff" if transparent_bg else str(bgcolor)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=dpi)
+    fig.patch.set_facecolor(plot_bgcolor)
+    ax.set_facecolor(plot_bgcolor)
+
+    west, south, east, north = bbox
+    ax.set_xlim(west, east)
+    ax.set_ylim(south, north)
+    lat0 = (south + north) / 2.0
+    cos_lat = max(1e-6, abs(math.cos(math.radians(lat0))))
+    ax.set_aspect(1.0 / cos_lat)
+
+    if trace_points and trace_color:
+        trace_lon = [lon for lat, lon in trace_points]
+        trace_lat = [lat for lat, lon in trace_points]
+        if len(trace_lon) >= 2:
+            ax.plot(
+                trace_lon,
+                trace_lat,
+                color=trace_color,
+                alpha=_clamp01(trace_opacity),
+                linewidth=max(0.1, float(trace_width)),
+                solid_capstyle="round",
+                solid_joinstyle="round",
+                zorder=5,
+            )
+
+    ax.margins(0)
+    ax.tick_params(which="both", direction="in")
+    _ = [s.set_visible(False) for s in ax.spines.values()]
+    ax.get_xaxis().set_visible(False)
+    ax.get_yaxis().set_visible(False)
+    ax.set_position([0.0, 0.0, 1.0, 1.0])
+
+    if transparent_bg:
+        fig.patch.set_alpha(0.0)
+        ax.patch.set_alpha(0.0)
+
+    buffer = BytesIO()
+    fig.savefig(
+        buffer,
+        format="png",
+        dpi=dpi,
+        bbox_inches=None,
+        pad_inches=0,
+        facecolor=fig.get_facecolor(),
+        transparent=transparent_bg,
+    )
+    plt.close(fig)
+
+    buffer.seek(0)
+    with Image.open(buffer) as rendered:
+        image = rendered.convert("RGBA")
+
+    if not transparent_bg:
+        opaque_bg = Image.new("RGBA", image.size, plot_bgcolor)
+        opaque_bg.alpha_composite(image)
+        image = opaque_bg
+
+    if image.size != (width_px, height_px):
+        image = image.resize((width_px, height_px), Image.Resampling.LANCZOS)
+    return image
+
+
 def add_map_v1(
     img: Image.Image,
     points: list[Any] | None = None,
@@ -1798,7 +1883,8 @@ def add_map_v2(
     img: Image.Image,
     points: list[Any] | None = None,
     center_point: tuple[float, float] | None = None,
-    dist_m: int = 15000,
+    dist_m: int | None = 15000,
+    map_padding: float = 0.15,
     width_cm: float = 10.0,
     height_cm: float = 8.0,
     map_width_cm: float | None = None,
@@ -1816,6 +1902,11 @@ def add_map_v2(
     minor_width: float = 0.5,
     major_width: float = 2.0,
     major_len_m: float = 400.0,
+    show_water: bool = True,
+    trace_color: str | None = "#d62828",
+    trace_opacity: float = 1.0,
+    trace_width: int = 3,
+    trace_points: list[Any] | None = None,
     border_color: str | None = None,
     border_opacity: float = 1.0,
     border_width: int = 0,
@@ -1826,9 +1917,8 @@ def add_map_v2(
     Passe soit ``points`` (liste de points GPX — le centre est calcule automatiquement),
     soit ``center_point`` (tuple (lat, lon) explicite).
 
-    ``top_left_x_cm``/``top_left_y_cm`` permettent un positionnement absolu
-    en centimetres depuis le coin haut-gauche (prioritaires sur ``x_cm``/``y_cm``).
-    ``map_width_cm``/``map_height_cm`` sont des alias explicites des dimensions.
+    ``show_water=False`` permet un mode "trace only" (aucune route, aucune riviere)
+    tout en conservant le meme cadrage geographique.
     """
     resolved_dpi = dpi if dpi is not None else int(img.info.get("dpi", DPI))
     resolved_width_cm = float(width_cm if map_width_cm is None else map_width_cm)
@@ -1852,6 +1942,7 @@ def add_map_v2(
     if box_w <= 2 or box_h <= 2:
         return img
 
+    geo: list[tuple[float, float]] = []
     if center_point is not None:
         resolved_center = center_point
     elif points:
@@ -1869,50 +1960,157 @@ def add_map_v2(
     else:
         raise ValueError("add_map_v2: passe 'points' (GPX) ou 'center_point' (lat, lon).")
 
-    try:
-        nx = importlib.import_module("networkx")
-        ox = importlib.import_module("osmnx")
-    except ImportError as exc:
-        raise ImportError("osmnx et networkx sont requis pour add_map_v2") from exc
-
-    g1 = ox.graph_from_point(
-        resolved_center,
-        dist=max(100, int(dist_m)),
-        dist_type="bbox",
-        network_type="all",
-        custom_filter='["natural"~"water"]',
-    )
-    g2 = ox.graph_from_point(
-        resolved_center,
-        dist=max(100, int(dist_m)),
-        dist_type="bbox",
-        network_type="all",
-        custom_filter='["waterway"~"river"]',
-    )
-    graph = nx.compose(g1, g2)
-
-    strong_color = major_water_color if major_water_color is not None else water_color
-    edge_colors: list[str] = []
-    edge_widths: list[float] = []
-    for _, _, _, attrs in graph.edges(keys=True, data=True):
-        length = float(attrs.get("length", 0.0))
-        if length > major_len_m:
-            edge_colors.append(strong_color)
-            edge_widths.append(major_width)
+    if dist_m is None:
+        if geo:
+            lat_span_m = (max(lat for lat, _ in geo) - min(lat for lat, _ in geo)) * 111320
+            lon_span_m = (
+                (max(lon for _, lon in geo) - min(lon for _, lon in geo))
+                * 111320
+                * math.cos(math.radians(resolved_center[0]))
+            )
+            half_diag = math.sqrt(lat_span_m ** 2 + lon_span_m ** 2) / 2.0
+            resolved_dist_m = max(500, int(half_diag * (1.0 + map_padding * 2)))
         else:
-            edge_colors.append(water_color)
-            edge_widths.append(minor_width)
+            resolved_dist_m = 5000
+    else:
+        resolved_dist_m = max(100, int(dist_m))
 
-    map_layer = _render_osmnx_graph_image(
-        graph=graph,
-        width_px=box_w,
-        height_px=box_h,
-        dpi=resolved_dpi,
-        bgcolor=bg_color,
-        edge_colors=edge_colors,
-        edge_widths=edge_widths,
-        edge_alpha=1.0,
-    )
+    render_bbox: tuple[float, float, float, float] | None = None
+    if geo:
+        min_lat = min(lat for lat, _ in geo)
+        max_lat = max(lat for lat, _ in geo)
+        min_lon = min(lon for _, lon in geo)
+        max_lon = max(lon for _, lon in geo)
+
+        lat_span = max(1e-9, max_lat - min_lat)
+        lon_span = max(1e-9, max_lon - min_lon)
+        pad = max(0.0, float(map_padding))
+        lat_span *= (1.0 + pad * 2.0)
+        lon_span *= (1.0 + pad * 2.0)
+
+        frame_ratio = float(box_w) / max(1.0, float(box_h))
+        cos_lat = max(1e-6, abs(math.cos(math.radians(resolved_center[0]))))
+        target_lat_over_lon = cos_lat / max(frame_ratio, 1e-9)
+        current_lat_over_lon = lat_span / lon_span
+
+        if current_lat_over_lon < target_lat_over_lon:
+            lat_span = lon_span * target_lat_over_lon
+        else:
+            lon_span = lat_span / max(target_lat_over_lon, 1e-9)
+
+        c_lat = (min_lat + max_lat) / 2.0
+        c_lon = (min_lon + max_lon) / 2.0
+        north = c_lat + lat_span / 2.0
+        south = c_lat - lat_span / 2.0
+        east = c_lon + lon_span / 2.0
+        west = c_lon - lon_span / 2.0
+        render_bbox = (west, south, east, north)
+    else:
+        frame_ratio = float(box_w) / max(1.0, float(box_h))
+        cos_lat = max(1e-6, abs(math.cos(math.radians(resolved_center[0]))))
+        lat_span = max(1e-9, (2.0 * float(resolved_dist_m)) / 111320.0)
+        lon_span = max(1e-9, (2.0 * float(resolved_dist_m)) / (111320.0 * cos_lat))
+        target_lat_over_lon = cos_lat / max(frame_ratio, 1e-9)
+        current_lat_over_lon = lat_span / lon_span
+        if current_lat_over_lon < target_lat_over_lon:
+            lat_span = lon_span * target_lat_over_lon
+        else:
+            lon_span = lat_span / max(target_lat_over_lon, 1e-9)
+        c_lat, c_lon = resolved_center
+        render_bbox = (
+            c_lon - lon_span / 2.0,
+            c_lat - lat_span / 2.0,
+            c_lon + lon_span / 2.0,
+            c_lat + lat_span / 2.0,
+        )
+
+    geo_to_draw: list[tuple[float, float]] = [
+        (_get_point_value(p, "lat", 0, 0.0), _get_point_value(p, "lon", 1, 0.0))
+        for p in (trace_points if trace_points is not None else (points or []))
+        if not (_get_point_value(p, "lat", 0, 0.0) == 0.0 and _get_point_value(p, "lon", 1, 0.0) == 0.0)
+    ]
+
+    if not show_water:
+        map_layer = _render_trace_only_image(
+            width_px=box_w,
+            height_px=box_h,
+            dpi=resolved_dpi,
+            bgcolor=bg_color,
+            bbox=render_bbox,
+            trace_points=geo_to_draw,
+            trace_color=trace_color,
+            trace_opacity=trace_opacity,
+            trace_width=max(1, int(trace_width)),
+        )
+    else:
+        try:
+            nx = importlib.import_module("networkx")
+            ox = importlib.import_module("osmnx")
+        except ImportError as exc:
+            raise ImportError("osmnx et networkx sont requis pour add_map_v2") from exc
+
+        try:
+            g1 = ox.graph_from_bbox(
+                bbox=render_bbox,
+                network_type="all",
+                simplify=True,
+                retain_all=True,
+                custom_filter='["natural"~"water"]',
+            )
+            g2 = ox.graph_from_bbox(
+                bbox=render_bbox,
+                network_type="all",
+                simplify=True,
+                retain_all=True,
+                custom_filter='["waterway"~"river"]',
+            )
+        except Exception:
+            # Fallback robuste pour les bbox tres fines ou zones sans noeuds OSM.
+            g1 = ox.graph_from_point(
+                resolved_center,
+                dist=resolved_dist_m,
+                dist_type="bbox",
+                network_type="all",
+                custom_filter='["natural"~"water"]',
+            )
+            g2 = ox.graph_from_point(
+                resolved_center,
+                dist=resolved_dist_m,
+                dist_type="bbox",
+                network_type="all",
+                custom_filter='["waterway"~"river"]',
+            )
+
+        graph = nx.compose(g1, g2)
+        strong_color = major_water_color if major_water_color is not None else water_color
+        edge_colors: list[str] = []
+        edge_widths: list[float] = []
+        for _, _, _, attrs in graph.edges(keys=True, data=True):
+            length = float(attrs.get("length", 0.0))
+            if length > major_len_m:
+                edge_colors.append(strong_color)
+                edge_widths.append(major_width)
+            else:
+                edge_colors.append(water_color)
+                edge_widths.append(minor_width)
+
+        map_layer, _, _, _, _ = _render_osmnx_graph_image(
+            graph=graph,
+            width_px=box_w,
+            height_px=box_h,
+            dpi=resolved_dpi,
+            bgcolor=bg_color,
+            edge_colors=edge_colors,
+            edge_widths=edge_widths,
+            edge_alpha=1.0,
+            forced_bbox=render_bbox,
+            bbox_points=geo_to_draw,
+            bbox_padding=map_padding,
+            trace_points=geo_to_draw,
+            trace_color=trace_color,
+            trace_opacity=trace_opacity,
+            trace_width=max(1, int(trace_width)),
+        )
 
     border_rgba = _resolve_rgba(border_color, border_opacity)
     if border_rgba is not None and border_width > 0:

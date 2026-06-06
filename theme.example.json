@@ -45,14 +45,32 @@
   },
   "layout": {
     "title_strip_width": 180,
-    "map_height_ratio": 0.64,
+    "map_height_ratio": 0.54,
     "stats_height": 160,
-    "profile_height": 170,
+    "gallery_height": 210,
+    "facts_height": 210,
     "section_gap": 30
   },
   "profile": {
     "fill_color": "#b7adc9",
     "line_color": "#8a7cb0",
     "grid_color": "#d8d4ca"
+  },
+  "gallery": {
+    "enabled": true,
+    "gap": 16,
+    "border_color": "#b8b5ab",
+    "border_width": 1,
+    "background": "#e9e6dd",
+    "caption_color": "#7a766d",
+    "caption_size": 15
+  },
+  "facts": {
+    "card_gap": 18,
+    "card_border_color": "#b8b5ab",
+    "card_border_width": 1,
+    "label_color": "#7a766d",
+    "value_color": "#312f2a",
+    "icon_color": "#8a7cb0"
   }
 }
